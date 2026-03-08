@@ -350,6 +350,7 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   } while (entry != NULL);
 
   // AML amcodec expects PTS in milliseconds, so convert the Moonlight microsecond timestamp by dividing by 1000.
+  // presentationTimeUs is in microseconds; amcodec expects milliseconds.
   codec_checkin_pts(&codecParam, decodeUnit->presentationTimeUs / 1000);
   decode_started_us = LiGetMicroseconds();
   while (length > 0) {

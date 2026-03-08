@@ -350,19 +350,15 @@ bool stats_overlay_runtime_refresh(void) {
 
     if (elapsed_seconds > 0.0) {
       // Divide frames by elapsed seconds to produce the three per-second throughput metrics.
-      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.incoming_network_fps, true,
-          stats_overlay_runtime_window.incoming_frames / elapsed_seconds);
+      double live_incoming_fps = stats_overlay_runtime_window.incoming_frames / elapsed_seconds;
+
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.incoming_network_fps, true, live_incoming_fps);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.decoding_fps, true,
           stats_overlay_runtime_window.decoded_frames / elapsed_seconds);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.rendering_fps, true,
           stats_overlay_runtime_window.rendered_frames / elapsed_seconds);
-    }
-
-    if (stats_overlay_runtime_window.stream_frame_interval_count != 0) {
-      // Average frame interval is in microseconds, so divide 1,000,000 by the interval to get dynamic stream FPS.
-      stats_overlay_runtime_snapshot.video_fps =
-          1000000.0 / (stats_overlay_runtime_window.stream_frame_interval_total_us /
-              stats_overlay_runtime_window.stream_frame_interval_count);
+      // Keep the first-line FPS dynamic by reflecting the measured incoming stream rate instead of the configured target FPS.
+      stats_overlay_runtime_snapshot.video_fps = live_incoming_fps;
     }
 
     // Populate averages only when samples exist so the overlay can still render Unavailable placeholders.

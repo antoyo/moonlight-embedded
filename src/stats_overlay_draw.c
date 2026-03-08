@@ -135,11 +135,17 @@ void stats_overlay_draw_yuv420(uint8_t* const planes[3], const int linesize[3], 
   int line;
   int text_width = (int)stats_overlay_measure_width(state);
   int text_height = (int)stats_overlay_measure_height(state);
+  int clear_width = (STATS_OVERLAY_MAX_LINE_LENGTH * STATS_OVERLAY_FONT_WIDTH) + (8 * STATS_OVERLAY_FONT_SCALE);
+  int clear_height = (STATS_OVERLAY_MAX_LINES * STATS_OVERLAY_FONT_HEIGHT) + (8 * STATS_OVERLAY_FONT_SCALE);
 
   if (state->line_count == 0 || planes[0] == NULL || linesize[0] <= 0)
     return;
 
-  // Draw a dark backing box first so the white glyphs stay legible on bright scenes.
+  // Clear the full reserved overlay region so shorter future lines cannot leave stale pixels behind.
+  stats_overlay_fill_y(planes[0], linesize[0], width, height, margin - (4 * STATS_OVERLAY_FONT_SCALE),
+      margin - (4 * STATS_OVERLAY_FONT_SCALE), clear_width, clear_height, 24);
+
+  // Draw a dark backing box sized to the currently formatted content for good contrast.
   stats_overlay_fill_y(planes[0], linesize[0], width, height, margin - (4 * STATS_OVERLAY_FONT_SCALE),
       margin - (4 * STATS_OVERLAY_FONT_SCALE), text_width + (8 * STATS_OVERLAY_FONT_SCALE),
       text_height + (8 * STATS_OVERLAY_FONT_SCALE), 24);
@@ -165,11 +171,38 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
   int line;
   int text_width = (int)stats_overlay_measure_width(state);
   int text_height = (int)stats_overlay_measure_height(state);
+  int clear_width = (STATS_OVERLAY_MAX_LINE_LENGTH * STATS_OVERLAY_FONT_WIDTH) + (8 * STATS_OVERLAY_FONT_SCALE);
+  int clear_height = (STATS_OVERLAY_MAX_LINES * STATS_OVERLAY_FONT_HEIGHT) + (8 * STATS_OVERLAY_FONT_SCALE);
 
   if (state->line_count == 0 || pixels == NULL || stride_pixels == 0)
     return;
 
   stats_overlay_clear_box(pixels, stride_pixels, width, height, 0);
+  {
+    int box_x = margin - (4 * STATS_OVERLAY_FONT_SCALE);
+    int box_y = margin - (4 * STATS_OVERLAY_FONT_SCALE);
+    int box_w = clear_width;
+    int box_h = clear_height;
+    int y;
+
+    for (y = 0; y < box_h; y++) {
+      int draw_y = box_y + y;
+      int x;
+
+      if (draw_y < 0 || draw_y >= height)
+        continue;
+
+      for (x = 0; x < box_w; x++) {
+        int draw_x = box_x + x;
+
+        if (draw_x < 0 || draw_x >= width)
+          continue;
+
+        pixels[(draw_y * stride_pixels) + draw_x] = bg_color;
+      }
+    }
+  }
+
   {
     int box_x = margin - (4 * STATS_OVERLAY_FONT_SCALE);
     int box_y = margin - (4 * STATS_OVERLAY_FONT_SCALE);
