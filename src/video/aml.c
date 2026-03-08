@@ -57,6 +57,9 @@ static size_t overlayStridePixels = 0;
 static size_t overlayPageCount = 0;
 static int overlayWidth = 0;
 static int overlayHeight = 0;
+static uint64_t pendingDecodeSubmitTimesUs[256];
+static unsigned int pendingDecodeSubmitHead = 0;
+static unsigned int pendingDecodeSubmitCount = 0;
 static bool overlayEnabled = false;
 static bool overlayReady = false;
 static bool overlayWarningEmitted = false;
@@ -103,6 +106,41 @@ static void aml_warn_overlay(const char* reason) {
 static void aml_clear_overlay(void) {
   if (overlayPixels != NULL)
     memset(overlayPixels, 0, overlayMapSize);
+}
+
+/** Resets the FIFO of AML submit timestamps used to estimate hardware decode latency. */
+static void aml_reset_decode_submit_times(void) {
+  pendingDecodeSubmitHead = 0;
+  pendingDecodeSubmitCount = 0;
+}
+
+/** Queues the submit timestamp for a compressed frame entering the AML decoder pipeline. */
+static void aml_push_decode_submit_time(uint64_t submit_time_us) {
+  unsigned int index;
+
+  if (submit_time_us == 0)
+    return;
+
+  if (pendingDecodeSubmitCount == (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]))) {
+    pendingDecodeSubmitHead = (pendingDecodeSubmitHead + 1) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
+    pendingDecodeSubmitCount--;
+  }
+
+  // The AML decoder outputs frames in decode order, so a FIFO gives the closest per-frame submit-to-output estimate available.
+  index = (pendingDecodeSubmitHead + pendingDecodeSubmitCount) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
+  pendingDecodeSubmitTimesUs[index] = submit_time_us;
+  pendingDecodeSubmitCount++;
+}
+
+/** Pops the oldest submit timestamp once the AML pipeline finishes a frame. */
+static bool aml_pop_decode_submit_time(uint64_t* submit_time_us) {
+  if (pendingDecodeSubmitCount == 0)
+    return false;
+
+  *submit_time_us = pendingDecodeSubmitTimesUs[pendingDecodeSubmitHead];
+  pendingDecodeSubmitHead = (pendingDecodeSubmitHead + 1) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
+  pendingDecodeSubmitCount--;
+  return true;
 }
 
 /** Returns the number of vertically stacked framebuffer pages exposed by the AML OSD plane. */
@@ -226,7 +264,7 @@ void* aml_display_thread(void* unused) {
     struct v4l2_buffer vbuf = { 0 };
     uint64_t frame_completed_us;
     uint64_t render_completed_us;
-    int video_delay_ms = 0;
+    uint64_t submit_started_us = 0;
     vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     if (ioctl(videoFd, VIDIOC_DQBUF, &vbuf) < 0) {
@@ -241,10 +279,10 @@ void* aml_display_thread(void* unused) {
     // A dequeued AML capture buffer corresponds to a frame that has completed the hardware decode/display pipeline.
     frame_completed_us = LiGetMicroseconds();
     if (overlayEnabled) {
-      if (codec_get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0 && video_delay_ms >= 0) {
-        // amcodec does not expose a true per-frame hardware decode duration, so use its current video delay
-        // as the best decoder-side latency estimate available from the AML stack for this completed frame.
-        stats_overlay_runtime_note_decoded_frame((double) video_delay_ms);
+      if (aml_pop_decode_submit_time(&submit_started_us) && frame_completed_us >= submit_started_us) {
+        // Amlogic does not expose per-frame decoder work time, so estimate it as submit-to-output pipeline time.
+        // This includes hardware decode plus decoder-side buffering, which is a better latency proxy than codec_write() cost.
+        stats_overlay_runtime_note_decoded_frame((frame_completed_us - submit_started_us) / 1000.0);
       } else {
         stats_overlay_runtime_note_decoded_output();
       }
@@ -279,6 +317,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.stream_type        = STREAM_TYPE_ES_VIDEO;
   codecParam.am_sysinfo.param   = 0;
   done = false;
+  aml_reset_decode_submit_times();
   overlayWarningEmitted = false;
   overlayEnabled = stats_pref != NULL && stats_pref->enabled;
   overlayReady = false;
@@ -385,12 +424,15 @@ void aml_cleanup() {
 
   codec_close(&codecParam);
   free(pkt_buf);
+  aml_reset_decode_submit_times();
   aml_overlay_destroy();
   stats_overlay_runtime_stop();
 }
 
 /** Submits a decode unit to AML and records the live overlay timing samples. */
 int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
+  uint64_t submit_started_us;
+
   ensure_buf_size(&pkt_buf, &pkt_buf_size, decodeUnit->fullLength);
   if (overlayEnabled)
     stats_overlay_runtime_note_decode_unit(decodeUnit);
@@ -406,6 +448,7 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   // AML amcodec expects PTS in milliseconds, so convert the Moonlight microsecond timestamp by dividing by 1000.
   // presentationTimeUs is in microseconds; amcodec expects milliseconds.
   codec_checkin_pts(&codecParam, decodeUnit->presentationTimeUs / 1000);
+  submit_started_us = LiGetMicroseconds();
   while (length > 0) {
     api = codec_write(&codecParam, pkt_buf+written, length);
     if (api < 0) {
@@ -424,6 +467,11 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
       written += api;
       length -= api;
     }
+  }
+
+  if (overlayEnabled && length == 0) {
+    // Record the time when the compressed frame finished entering amcodec so the display thread can estimate pipeline latency.
+    aml_push_decode_submit_time(submit_started_us);
   }
 
   return length ? DR_NEED_IDR : DR_OK;
