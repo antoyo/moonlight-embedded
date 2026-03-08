@@ -54,6 +54,10 @@
 #include <arpa/inet.h>
 #include <openssl/rand.h>
 
+static STATS_OVERLAY_STATE stats_overlay_state;
+static STATS_OVERLAY_SNAPSHOT stats_overlay_snapshot;
+
+/** Prints the available app list returned by the host. */
 static void applist(PSERVER_DATA server) {
   PAPP_LIST list = NULL;
   if (gs_applist(server, &list) != GS_OK) {
@@ -67,6 +71,7 @@ static void applist(PSERVER_DATA server) {
   }
 }
 
+/** Resolves an app name to the host-provided app identifier. */
 static int get_app_id(PSERVER_DATA server, const char *name) {
   PAPP_LIST list = NULL;
   if (gs_applist(server, &list) != GS_OK) {
@@ -83,7 +88,9 @@ static int get_app_id(PSERVER_DATA server, const char *name) {
   return -1;
 }
 
+/** Starts a streaming session with the selected backend and runtime options. */
 static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform system) {
+  STATS_OVERLAY_CAPABILITY overlay_capability;
   int appId = get_app_id(server, config->app);
   if (appId<0) {
     fprintf(stderr, "Can't find app %s\n", config->app);
@@ -139,6 +146,18 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
     connection_debug = true;
   }
 
+  // Lock the overlay preference once the session is about to start so later config edits do not affect it.
+  stats_overlay_init(&stats_overlay_state);
+  stats_overlay_snapshot_init(&stats_overlay_snapshot);
+  stats_overlay_snapshot_set_stream(&stats_overlay_snapshot, config->stream.width, config->stream.height, config->stream.fps,
+      config->codec == CODEC_HEVC ? "HEVC" : config->codec == CODEC_AV1 ? "AV1" : "H264");
+  platform_get_overlay_capability(system, &overlay_capability);
+  stats_overlay_pref_lock(&config->stats_overlay);
+  stats_overlay_session_start(&stats_overlay_state, &config->stats_overlay, &overlay_capability);
+  connection_reset_stats_overlay_warning();
+  if (stats_overlay_should_warn(&stats_overlay_state, &config->stats_overlay, &overlay_capability))
+    connection_warn_stats_overlay_unsupported(overlay_capability.unsupported_reason);
+
   if (IS_EMBEDDED(system))
     loop_init();
 
@@ -166,8 +185,11 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   }
 
   platform_stop(system);
+  stats_overlay_session_stop(&stats_overlay_state);
+  stats_overlay_pref_unlock(&config->stats_overlay);
 }
 
+/** Prints the CLI help text and exits. */
 static void help() {
   #ifdef GIT_BRANCH
   printf("Moonlight Embedded %d.%d.%d-%s-%s\n", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, GIT_BRANCH, GIT_COMMIT_HASH);
@@ -203,6 +225,8 @@ static void help() {
   printf("\t-packetsize <size>\tSpecify the maximum packetsize in bytes\n");
   printf("\t-codec <codec>\t\tSelect used codec: auto/h264/h265/av1 (default auto)\n");
   printf("\t-hdr\t\tEnable HDR streaming (experimental, requires host and device support)\n");
+  printf("\t-stats\t\t\tEnable the real-time stats overlay for this session\n");
+  printf("\t-nostats\t\tDisable the real-time stats overlay for this session\n");
   printf("\t-remote <yes/no/auto>\t\t\tEnable optimizations for WAN streaming (default auto)\n");
   printf("\t-app <app>\t\tName of app to stream\n");
   printf("\t-nosops\t\t\tDon't allow GFE to modify game settings\n");
@@ -228,6 +252,7 @@ static void help() {
   exit(0);
 }
 
+/** Fails fast when the target host is not paired yet. */
 static void pair_check(PSERVER_DATA server) {
   if (!server->paired) {
     fprintf(stderr, "You must pair with the PC first\n");
@@ -235,6 +260,7 @@ static void pair_check(PSERVER_DATA server) {
   }
 }
 
+/** Parses CLI input and dispatches the selected top-level action. */
 int main(int argc, char* argv[]) {
   CONFIGURATION config;
   config_parse(argc, argv, &config);

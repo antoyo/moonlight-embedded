@@ -32,4 +32,8 @@ C99 + CMake: keep CLI/config changes backward compatible, keep backend-specific 
 - 001-stats-overlay: Added C99, CMake 3.6 + libgamestream client layer, Moonlight Common C / Limelight callbacks, FFmpeg-backed decode paths, SDL2, X11/EGL/VAAPI/VDPAU, optional embedded video backends (PI/MMAL/IMX/AML/RK)
 
 <!-- MANUAL ADDITIONS START -->
+## Coding Rules
+- Every function MUST have a doc-comment.
+- Functions longer than 10 lines MUST contain inline comments.
+- Complex logic MUST be commented.
 <!-- MANUAL ADDITIONS END -->

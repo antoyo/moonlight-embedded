@@ -77,9 +77,12 @@ static struct option long_options[] = {
   {"pin", required_argument, NULL, '5'},
   {"port", required_argument, NULL, '6'},
   {"hdr", no_argument, NULL, '7'},
+  {"stats", no_argument, NULL, '8'},
+  {"nostats", no_argument, NULL, '9'},
   {0, 0, 0, 0},
 };
 
+/** Resolves a config or data file path using the project search order. */
 char* get_path(char* name, char* extra_data_dirs) {
   const char *xdg_config_dir = getenv("XDG_CONFIG_DIR");
   const char *home_dir = getenv("HOME");
@@ -131,6 +134,7 @@ char* get_path(char* name, char* extra_data_dirs) {
   return NULL;
 }
 
+/** Applies one parsed CLI or config option to the active configuration. */
 static void parse_argument(int c, char* value, PCONFIGURATION config) {
   switch (c) {
   case 'a':
@@ -260,6 +264,12 @@ static void parse_argument(int c, char* value, PCONFIGURATION config) {
   case '7':
     config->hdr = true;
     break;
+  case '8':
+    stats_overlay_pref_apply(&config->stats_overlay, true, STATS_OVERLAY_SOURCE_CLI);
+    break;
+  case '9':
+    stats_overlay_pref_apply(&config->stats_overlay, false, STATS_OVERLAY_SOURCE_CLI);
+    break;
   case 1:
     if (config->action == NULL)
       config->action = value;
@@ -272,6 +282,7 @@ static void parse_argument(int c, char* value, PCONFIGURATION config) {
   }
 }
 
+/** Loads a config file and maps supported keys onto the runtime configuration. */
 bool config_file_parse(char* filename, PCONFIGURATION config) {
   FILE* fd = fopen(filename, "r");
   if (fd == NULL) {
@@ -282,6 +293,7 @@ bool config_file_parse(char* filename, PCONFIGURATION config) {
   char *line = NULL;
   size_t len = 0;
 
+  // Keep config-file precedence identical to CLI parsing by reusing parse_argument() where possible.
   while (getline(&line, &len, fd) != -1) {
     char *key = NULL, *value = NULL;
     if (sscanf(line, "%ms = %m[^\n]", &key, &value) == 2) {
@@ -289,6 +301,8 @@ bool config_file_parse(char* filename, PCONFIGURATION config) {
         config->address = value;
       } else if (strcmp(key, "sops") == 0) {
         config->sops = strcmp("true", value) == 0;
+      } else if (strcmp(key, "stats") == 0) {
+        stats_overlay_pref_apply(&config->stats_overlay, strcmp("true", value) == 0, STATS_OVERLAY_SOURCE_CONFIG);
       } else {
         for (int i=0;long_options[i].name != NULL;i++) {
           if (strcmp(long_options[i].name, key) == 0) {
@@ -304,6 +318,7 @@ bool config_file_parse(char* filename, PCONFIGURATION config) {
   return true;
 }
 
+/** Saves the non-default configuration values back to a config file. */
 void config_save(char* filename, PCONFIGURATION config) {
   FILE* fd = fopen(filename, "w");
   if (fd == NULL) {
@@ -331,6 +346,8 @@ void config_save(char* filename, PCONFIGURATION config) {
     write_config_bool(fd, "viewonly", config->viewonly);
   if (config->rotate != 0)
     write_config_int(fd, "rotate", config->rotate);
+  if (config->stats_overlay.enabled)
+    write_config_bool(fd, "stats", config->stats_overlay.enabled);
 
   if (strcmp(config->app, "Steam") != 0)
     write_config_string(fd, "app", config->app);
@@ -338,6 +355,7 @@ void config_save(char* filename, PCONFIGURATION config) {
   fclose(fd);
 }
 
+/** Initializes defaults, loads config files, then applies CLI overrides. */
 void config_parse(int argc, char* argv[], PCONFIGURATION config) {
   LiInitializeStreamConfiguration(&config->stream);
 
@@ -382,6 +400,7 @@ void config_parse(int argc, char* argv[], PCONFIGURATION config) {
   config->hdr = false;
   config->pin = 0;
   config->port = 47989;
+  stats_overlay_pref_init(&config->stats_overlay);
 
   config->inputsCount = 0;
   config->mapping = get_path("gamecontrollerdb.txt", getenv("XDG_DATA_DIRS"));
@@ -399,7 +418,8 @@ void config_parse(int argc, char* argv[], PCONFIGURATION config) {
   } else {
     int option_index = 0;
     int c;
-    while ((c = getopt_long_only(argc, argv, "-abc:d:efg:h:i:j:k:lm:no:p:q:r:s:tu:v:w:xy45:6:7", long_options, &option_index)) != -1) {
+    // CLI options are parsed last so they override the config-file preference source.
+    while ((c = getopt_long_only(argc, argv, "-abc:d:efg:h:i:j:k:lm:no:p:q:r:s:tu:v:w:xy45:6:789", long_options, &option_index)) != -1) {
       parse_argument(c, optarg, config);
     }
   }
@@ -419,6 +439,7 @@ void config_parse(int argc, char* argv[], PCONFIGURATION config) {
   }
 
   if (config->stream.bitrate == -1) {
+    // Preserve the existing bitrate ladder so the overlay feature does not change stream defaults.
     // This table prefers 16:10 resolutions because they are
     // only slightly more pixels than the 16:9 equivalents, so
     // we don't want to bump those 16:10 resolutions up to the

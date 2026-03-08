@@ -33,6 +33,7 @@
 
 typedef bool(*ImxInit)();
 
+/** Selects the first supported runtime backend that matches the requested name. */
 enum platform platform_check(char* name) {
   bool std = strcmp(name, "auto") == 0;
   #ifdef HAVE_IMX
@@ -105,6 +106,7 @@ enum platform platform_check(char* name) {
   return 0;
 }
 
+/** Applies backend-specific display setup before streaming starts. */
 void platform_start(enum platform system) {
   switch (system) {
   #ifdef HAVE_AML
@@ -122,6 +124,7 @@ void platform_start(enum platform system) {
   }
 }
 
+/** Restores backend-specific display state after streaming stops. */
 void platform_stop(enum platform system) {
   switch (system) {
   #ifdef HAVE_AML
@@ -138,6 +141,7 @@ void platform_stop(enum platform system) {
   }
 }
 
+/** Returns the video renderer callbacks for the chosen backend. */
 DECODER_RENDERER_CALLBACKS* platform_get_video(enum platform system) {
   switch (system) {
   #ifdef HAVE_X11
@@ -180,6 +184,7 @@ DECODER_RENDERER_CALLBACKS* platform_get_video(enum platform system) {
   return NULL;
 }
 
+/** Returns the audio renderer callbacks for the chosen backend. */
 AUDIO_RENDERER_CALLBACKS* platform_get_audio(enum platform system, char* audio_device) {
   switch (system) {
   case FAKE:
@@ -195,6 +200,7 @@ AUDIO_RENDERER_CALLBACKS* platform_get_audio(enum platform system, char* audio_d
     // fall-through
   #endif
   default:
+    // Prefer PulseAudio when available, then fall back to the platform default sink.
     #ifdef HAVE_PULSE
     if (audio_pulse_init(audio_device))
       return &audio_callbacks_pulse;
@@ -209,6 +215,7 @@ AUDIO_RENDERER_CALLBACKS* platform_get_audio(enum platform system, char* audio_d
   return NULL;
 }
 
+/** Reports whether a backend is a good fit for the requested codec. */
 bool platform_prefers_codec(enum platform system, enum codecs codec) {
   switch (codec) {
   case CODEC_H264:
@@ -229,6 +236,7 @@ bool platform_prefers_codec(enum platform system, enum codecs codec) {
   return false;
 }
 
+/** Returns a user-facing name for the chosen backend. */
 char* platform_name(enum platform system) {
   switch(system) {
   case PI:
@@ -253,5 +261,23 @@ char* platform_name(enum platform system) {
     return "Fake (no a/v output)";
   default:
     return "Unknown";
+  }
+}
+
+/** Describes whether the chosen backend can composite the stats overlay. */
+void platform_get_overlay_capability(enum platform system, PSTATS_OVERLAY_CAPABILITY capability) {
+  switch (system) {
+  case SDL:
+  case X11:
+  case X11_VDPAU:
+  case X11_VAAPI:
+    stats_overlay_capability_init(capability, true, true, NULL);
+    break;
+  case AML:
+    stats_overlay_capability_init(capability, false, false, "The AML backend does not support stats overlay compositing yet.");
+    break;
+  default:
+    stats_overlay_capability_init(capability, false, false, "This backend does not support the stats overlay yet.");
+    break;
   }
 }

@@ -21,6 +21,8 @@
 
 #include <stdbool.h>
 
+#include "stats_overlay.h"
+
 #define MAX_INPUTS 6
 
 typedef struct _CONFIGURATION {
@@ -48,6 +50,7 @@ typedef struct _CONFIGURATION {
   bool hdr;
   int pin;
   unsigned short port;
+  STATS_OVERLAY_PREFERENCE stats_overlay;
 } CONFIGURATION, *PCONFIGURATION;
 
 extern bool inputAdded;

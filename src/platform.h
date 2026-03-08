@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include "stats_overlay.h"
+
 #define IS_EMBEDDED(SYSTEM) SYSTEM != SDL
 
 enum platform { NONE, SDL, X11, X11_VDPAU, X11_VAAPI, PI, MMAL, IMX, AML, RK, FAKE };
@@ -34,6 +36,7 @@ PDECODER_RENDERER_CALLBACKS platform_get_video(enum platform system);
 PAUDIO_RENDERER_CALLBACKS platform_get_audio(enum platform system, char* audio_device);
 bool platform_prefers_codec(enum platform system, enum codecs codec);
 char* platform_name(enum platform system);
+void platform_get_overlay_capability(enum platform system, PSTATS_OVERLAY_CAPABILITY capability);
 
 void platform_start(enum platform system);
 void platform_stop(enum platform system);

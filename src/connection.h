@@ -29,3 +29,6 @@ extern ConnListenerRumble rumble_handler;
 extern ConnListenerRumbleTriggers rumble_triggers_handler;
 extern ConnListenerSetMotionEventState set_motion_event_state_handler;
 extern ConnListenerSetControllerLED set_controller_led_handler;
+
+void connection_reset_stats_overlay_warning(void);
+void connection_warn_stats_overlay_unsupported(const char* reason);

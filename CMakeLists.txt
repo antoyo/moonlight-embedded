@@ -6,6 +6,7 @@ include(${CMAKE_ROOT}/Modules/GNUInstallDirs.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/generate_version_header.cmake)
 
 include(CheckCSourceCompiles)
+include(CTest)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-pointer-sign -Wno-sign-compare -Wno-switch)
 
@@ -231,3 +232,7 @@ add_subdirectory(docs)
 install(TARGETS moonlight DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES ./third_party/SDL_GameControllerDB/gamecontrollerdb.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/moonlight)
 install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR})
+
+if (BUILD_TESTING)
+  add_subdirectory(tests)
+endif()

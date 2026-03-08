@@ -33,7 +33,9 @@ ConnListenerRumble rumble_handler = NULL;
 ConnListenerRumbleTriggers rumble_triggers_handler = NULL;
 ConnListenerSetMotionEventState set_motion_event_state_handler = NULL;
 ConnListenerSetControllerLED set_controller_led_handler = NULL;
+static bool stats_overlay_warning_emitted = false;
 
+/** Terminates the session and signals the active main loop to exit. */
 static void connection_terminated(int errorCode) {
   switch (errorCode) {
   case ML_ERROR_GRACEFUL_TERMINATION:
@@ -66,6 +68,7 @@ static void connection_terminated(int errorCode) {
     pthread_kill(main_thread_id, SIGTERM);
 }
 
+/** Forwards Moonlight log messages to stdout. */
 static void connection_log_message(const char* format, ...) {
   va_list arglist;
   va_start(arglist, format);
@@ -73,26 +76,31 @@ static void connection_log_message(const char* format, ...) {
   va_end(arglist);
 }
 
+/** Passes controller rumble to the active input backend. */
 static void rumble(unsigned short controllerNumber, unsigned short lowFreqMotor, unsigned short highFreqMotor) {
   if (rumble_handler)
     rumble_handler(controllerNumber, lowFreqMotor, highFreqMotor);
 }
 
+/** Passes trigger-rumble updates to the active input backend. */
 static void rumble_triggers(unsigned short controllerNumber, unsigned short leftTrigger, unsigned short rightTrigger) {
   if (rumble_handler)
     rumble_triggers_handler(controllerNumber, leftTrigger, rightTrigger);
 }
 
+/** Passes motion-report toggles to the active input backend. */
 static void set_motion_event_state(unsigned short controllerNumber, unsigned char motionType, unsigned short reportRateHz) {
   if (set_motion_event_state_handler)
     set_motion_event_state_handler(controllerNumber, motionType, reportRateHz);
 }
 
+/** Passes controller LED updates to the active input backend. */
 static void set_controller_led(unsigned short controllerNumber, unsigned char r, unsigned char g, unsigned char b) {
   if (set_controller_led_handler)
     set_controller_led_handler(controllerNumber, r, g, b);
 }
 
+/** Logs coarse connection-health changes from Moonlight Common C. */
 static void connection_status_update(int status) {
   switch (status) {
     case CONN_STATUS_OKAY:
@@ -102,6 +110,20 @@ static void connection_status_update(int status) {
       printf("Connection is poor\n");
       break;
   }
+}
+
+/** Resets the once-per-session unsupported-overlay warning latch. */
+void connection_reset_stats_overlay_warning(void) {
+  stats_overlay_warning_emitted = false;
+}
+
+/** Emits a single user-visible warning when the active backend cannot draw the overlay. */
+void connection_warn_stats_overlay_unsupported(const char* reason) {
+  if (stats_overlay_warning_emitted)
+    return;
+
+  printf("Stats overlay unavailable: %s\n", reason ? reason : "the active backend does not support it.");
+  stats_overlay_warning_emitted = true;
 }
 
 CONNECTION_LISTENER_CALLBACKS connection_callbacks = {

@@ -21,8 +21,8 @@
 
 **Purpose**: Create the test and build scaffolding needed for the feature branch.
 
-- [ ] T001 Enable CTest and add stats-overlay test entry points in `CMakeLists.txt` and `tests/CMakeLists.txt`
-- [ ] T002 [P] Create stats-overlay test harness files in `tests/stats_overlay/test_stats_overlay_config.c` and `tests/stats_overlay/test_stats_overlay_runtime.c`
+- [X] T001 Enable CTest and add stats-overlay test entry points in `CMakeLists.txt` and `tests/CMakeLists.txt`
+- [X] T002 [P] Create stats-overlay test harness files in `tests/stats_overlay/test_stats_overlay_config.c` and `tests/stats_overlay/test_stats_overlay_runtime.c`
 
 ---
 
@@ -32,12 +32,12 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T003 Add stats preference fields and config parsing scaffolding in `src/config.h` and `src/config.c`
-- [ ] T004 [P] Create shared overlay state and formatter interfaces in `src/stats_overlay.h` and `src/stats_overlay.c`
-- [ ] T005 [P] Create in-tree bitmap font and draw helpers in `src/stats_overlay_font.h` and `src/stats_overlay_draw.c`
-- [ ] T006 Add session lifecycle hooks for overlay state in `src/main.c`, `src/platform.h`, and `src/platform.c`
-- [ ] T007 Add foundational config and formatter coverage in `tests/CMakeLists.txt`, `tests/stats_overlay/test_stats_overlay_config.c`, and `tests/stats_overlay/test_stats_overlay_runtime.c`
-- [ ] T008 Add backend capability and warning plumbing in `src/connection.h`, `src/connection.c`, and `src/stats_overlay.h`
+- [X] T003 Add stats preference fields and config parsing scaffolding in `src/config.h` and `src/config.c`
+- [X] T004 [P] Create shared overlay state and formatter interfaces in `src/stats_overlay.h` and `src/stats_overlay.c`
+- [X] T005 [P] Create in-tree bitmap font and draw helpers in `src/stats_overlay_font.h` and `src/stats_overlay_draw.c`
+- [X] T006 Add session lifecycle hooks for overlay state in `src/main.c`, `src/platform.h`, and `src/platform.c`
+- [X] T007 Add foundational config and formatter coverage in `tests/CMakeLists.txt`, `tests/stats_overlay/test_stats_overlay_config.c`, and `tests/stats_overlay/test_stats_overlay_runtime.c`
+- [X] T008 Add backend capability and warning plumbing in `src/connection.h`, `src/connection.c`, and `src/stats_overlay.h`
 
 **Checkpoint**: Shared stats-overlay infrastructure is ready; user story work can begin.
 
