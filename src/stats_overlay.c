@@ -228,6 +228,7 @@ void stats_overlay_runtime_stop(void) {
 /** Records incoming frame timing information from the assembled decode unit. */
 void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit) {
   uint64_t now_us = LiGetMicroseconds();
+  // Moonlight reports host latency in tenths of a millisecond, so divide by 10 to display real milliseconds.
   double host_latency_ms = decode_unit->frameHostProcessingLatency / 10.0;
 
   pthread_mutex_lock(&stats_overlay_runtime_mutex);
@@ -235,6 +236,7 @@ void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit) {
   stats_overlay_runtime_window.incoming_frames++;
 
   if (decode_unit->enqueueTimeUs != 0 && now_us >= decode_unit->enqueueTimeUs) {
+    // Convert the microsecond queue timestamp delta into milliseconds for the overlay contract.
     stats_overlay_runtime_window.queue_delay_total_ms += (now_us - decode_unit->enqueueTimeUs) / 1000.0;
     stats_overlay_runtime_window.queue_delay_count++;
   }
@@ -292,9 +294,11 @@ bool stats_overlay_runtime_refresh(void) {
     stats_overlay_runtime_window.started_at_ms = now_ms;
 
   if (now_ms >= stats_overlay_runtime_window.started_at_ms + stats_overlay_runtime_state_data.refresh_interval_ms) {
+    // Convert the refresh window from milliseconds to seconds so frame counters become FPS values.
     double elapsed_seconds = (now_ms - stats_overlay_runtime_window.started_at_ms) / 1000.0;
 
     if (elapsed_seconds > 0.0) {
+      // Divide frames by elapsed seconds to produce the three per-second throughput metrics.
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.incoming_network_fps, true,
           stats_overlay_runtime_window.incoming_frames / elapsed_seconds);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.decoding_fps, true,
@@ -306,14 +310,17 @@ bool stats_overlay_runtime_refresh(void) {
     // Populate averages only when samples exist so the overlay can still render Unavailable placeholders.
     stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.decode_time_avg_ms,
         stats_overlay_runtime_window.decoded_frames != 0,
+        // Divide the total measured decode time by the number of decoded frames to get an average per frame.
         stats_overlay_runtime_window.decoded_frames != 0 ?
             stats_overlay_runtime_window.decode_time_total_ms / stats_overlay_runtime_window.decoded_frames : 0.0);
     stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.render_time_avg_ms,
         stats_overlay_runtime_window.rendered_frames != 0,
+        // Divide the total present cost by rendered frames to keep the metric stable across refresh windows.
         stats_overlay_runtime_window.rendered_frames != 0 ?
             stats_overlay_runtime_window.render_time_total_ms / stats_overlay_runtime_window.rendered_frames : 0.0);
     stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.queue_delay_avg_ms,
         stats_overlay_runtime_window.queue_delay_count != 0,
+        // Queue delay is accumulated per frame in milliseconds, so divide by the sample count for the average.
         stats_overlay_runtime_window.queue_delay_count != 0 ?
             stats_overlay_runtime_window.queue_delay_total_ms / stats_overlay_runtime_window.queue_delay_count : 0.0);
 
@@ -321,6 +328,7 @@ bool stats_overlay_runtime_refresh(void) {
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_min_ms, true, stats_overlay_runtime_window.host_latency_min_ms);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_max_ms, true, stats_overlay_runtime_window.host_latency_max_ms);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_avg_ms, true,
+          // Average the per-frame host latency samples after they were converted to milliseconds.
           stats_overlay_runtime_window.host_latency_total_ms / stats_overlay_runtime_window.host_latency_count);
     } else {
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_min_ms, false, 0.0);
@@ -335,8 +343,10 @@ bool stats_overlay_runtime_refresh(void) {
       uint32_t delta_oos = video_stats->packetCountOOS - stats_overlay_runtime_window.last_video_stats.packetCountOOS;
 
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_drop_pct, delta_total != 0,
+          // Convert failed-packet counts into a percentage of packets seen in the same sampling window.
           delta_total != 0 ? (delta_failed * 100.0) / delta_total : 0.0);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.jitter_drop_pct, delta_total != 0,
+          // Treat out-of-sequence packet growth as the jitter-related loss ratio for the same packet window.
           delta_total != 0 ? (delta_oos * 100.0) / delta_total : 0.0);
     } else {
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_drop_pct, false, 0.0);
@@ -349,7 +359,9 @@ bool stats_overlay_runtime_refresh(void) {
     }
 
     if (LiGetEstimatedRttInfo(&rtt, &rtt_variance)) {
+      // RTT is round-trip latency, so divide by 2 to approximate one-way network latency for the overlay.
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_avg_ms, true, rtt / 2.0);
+      // RTT variance is also round-trip, so halve it to keep the displayed variance on the same one-way scale.
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_variance_ms, true, rtt_variance / 2.0);
     } else {
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_avg_ms, false, 0.0);

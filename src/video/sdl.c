@@ -75,6 +75,7 @@ static int sdl_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   AVFrame* frame = ffmpeg_get_frame(false);
   if (frame != NULL) {
     // Sample decoder throughput before the frame is handed to the SDL presenter thread.
+    // LiGetMicroseconds() returns microseconds, so divide by 1000 to store decode cost in milliseconds.
     stats_overlay_runtime_note_decoded_frame((LiGetMicroseconds() - decode_started_us) / 1000.0);
     stats_overlay_runtime_refresh();
     if (stats_overlay_runtime_is_visible())

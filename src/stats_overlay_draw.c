@@ -88,7 +88,11 @@ static void stats_overlay_draw_glyph_y(uint8_t* y_plane, int stride, int frame_w
     uint8_t bits = stats_overlay_glyph_row(ch, row);
     for (col = 0; col < 5; col++) {
       if (bits & (1U << (4 - col)))
-        stats_overlay_fill_y(y_plane, stride, frame_width, frame_height, x0 + (int) col, y0 + (int) row, 1, 1, 235);
+        // Expand each bitmap pixel into a 3x3 block so the text stays readable on TVs and fullscreen sessions.
+        stats_overlay_fill_y(y_plane, stride, frame_width, frame_height,
+            x0 + ((int) col * STATS_OVERLAY_FONT_SCALE),
+            y0 + ((int) row * STATS_OVERLAY_FONT_SCALE),
+            STATS_OVERLAY_FONT_SCALE, STATS_OVERLAY_FONT_SCALE, 235);
     }
   }
 }
@@ -127,7 +131,7 @@ void stats_overlay_clear_box(uint32_t* pixels, size_t stride_pixels, size_t widt
 
 /** Draws the formatted overlay text directly onto a YUV420 frame. */
 void stats_overlay_draw_yuv420(uint8_t* const planes[3], const int linesize[3], int width, int height, const STATS_OVERLAY_STATE* state) {
-  int margin = 8;
+  int margin = 8 * STATS_OVERLAY_FONT_SCALE;
   int line;
   int text_width = (int)stats_overlay_measure_width(state);
   int text_height = (int)stats_overlay_measure_height(state);
@@ -136,7 +140,9 @@ void stats_overlay_draw_yuv420(uint8_t* const planes[3], const int linesize[3], 
     return;
 
   // Draw a dark backing box first so the white glyphs stay legible on bright scenes.
-  stats_overlay_fill_y(planes[0], linesize[0], width, height, margin - 4, margin - 4, text_width + 8, text_height + 8, 24);
+  stats_overlay_fill_y(planes[0], linesize[0], width, height, margin - (4 * STATS_OVERLAY_FONT_SCALE),
+      margin - (4 * STATS_OVERLAY_FONT_SCALE), text_width + (8 * STATS_OVERLAY_FONT_SCALE),
+      text_height + (8 * STATS_OVERLAY_FONT_SCALE), 24);
 
   // Render each line into the luma plane using the fixed-width bitmap font.
   for (line = 0; line < (int) state->line_count; line++) {

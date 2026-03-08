@@ -67,6 +67,7 @@ static int frame_handle(int pipefd) {
     else if (ffmpeg_decoder == VAAPI)
       vaapi_queue(frame, window, display_width, display_height);
     #endif
+    // LiGetMicroseconds() returns microseconds, so divide by 1000 to report render cost in milliseconds.
     stats_overlay_runtime_note_render((LiGetMicroseconds() - render_started_us) / 1000.0);
   }
 
@@ -193,6 +194,7 @@ int x11_submit_decode_unit(PDECODE_UNIT decodeUnit) {
 
   AVFrame* frame = ffmpeg_get_frame(true);
   if (frame != NULL) {
+    // LiGetMicroseconds() returns microseconds, so divide by 1000 to store decode cost in milliseconds.
     stats_overlay_runtime_note_decoded_frame((LiGetMicroseconds() - decode_started_us) / 1000.0);
     stats_overlay_runtime_refresh();
     if (ffmpeg_decoder == SOFTWARE && stats_overlay_runtime_is_visible())

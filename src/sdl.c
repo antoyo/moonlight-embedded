@@ -110,6 +110,7 @@ void sdl_loop() {
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, bmp, NULL, NULL);
             SDL_RenderPresent(renderer);
+            // LiGetMicroseconds() returns microseconds, so divide by 1000 to report render cost in milliseconds.
             stats_overlay_runtime_note_render((LiGetMicroseconds() - render_started_us) / 1000.0);
           } else
             fprintf(stderr, "Couldn't lock mutex\n");
