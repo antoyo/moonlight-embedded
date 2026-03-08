@@ -169,49 +169,16 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
     uint32_t fg_color, uint32_t bg_color) {
   int margin = 8 * STATS_OVERLAY_FONT_SCALE;
   int line;
-  int clear_width = STATS_OVERLAY_MAX_LINE_LENGTH * STATS_OVERLAY_FONT_WIDTH;
 
   if (state->line_count == 0 || pixels == NULL || stride_pixels == 0)
     return;
 
+  (void) bg_color;
+
   for (line = 0; line < (int) state->line_count; line++) {
     int x = margin;
     int y = margin + (line * STATS_OVERLAY_FONT_HEIGHT);
-    int line_width = (int) strlen(state->formatted_lines[line]) * STATS_OVERLAY_FONT_WIDTH;
-    int row;
     const char* cursor = state->formatted_lines[line];
-
-    // Repaint only the area covered by the current line so glyph changes do not leave stale pixels behind.
-    for (row = 0; row < STATS_OVERLAY_FONT_HEIGHT; row++) {
-      int draw_y = y + row;
-      int col;
-
-      if (draw_y < 0 || draw_y >= height)
-        continue;
-
-      for (col = 0; col < line_width; col++) {
-        int draw_x = x + col;
-
-        if (draw_x >= 0 && draw_x < width)
-          pixels[(draw_y * stride_pixels) + draw_x] = bg_color;
-      }
-    }
-
-    // Clear only the trailing portion of the reserved line width so shorter updates do not blink the full overlay box.
-    for (row = 0; row < STATS_OVERLAY_FONT_HEIGHT; row++) {
-      int draw_y = y + row;
-      int col;
-
-      if (draw_y < 0 || draw_y >= height)
-        continue;
-
-      for (col = line_width; col < clear_width; col++) {
-        int draw_x = x + col;
-
-        if (draw_x >= 0 && draw_x < width)
-          pixels[(draw_y * stride_pixels) + draw_x] = 0;
-      }
-    }
 
     while (*cursor != '\0') {
       unsigned int row;
@@ -240,27 +207,6 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
 
       x += STATS_OVERLAY_FONT_WIDTH;
       cursor++;
-    }
-  }
-
-  for (line = (int) state->line_count; line < STATS_OVERLAY_MAX_LINES; line++) {
-    int y = margin + (line * STATS_OVERLAY_FONT_HEIGHT);
-    int row;
-
-    // Clear now-unused lines so stale text disappears without wiping the active lines above.
-    for (row = 0; row < STATS_OVERLAY_FONT_HEIGHT; row++) {
-      int draw_y = y + row;
-      int col;
-
-      if (draw_y < 0 || draw_y >= height)
-        continue;
-
-      for (col = 0; col < clear_width; col++) {
-        int draw_x = margin + col;
-
-        if (draw_x >= 0 && draw_x < width)
-          pixels[(draw_y * stride_pixels) + draw_x] = 0;
-      }
     }
   }
 }
