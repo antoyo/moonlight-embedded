@@ -26,6 +26,7 @@
 
 #include "../input/x11.h"
 #include "../loop.h"
+#include "../stats_overlay.h"
 #include "../util.h"
 
 #include <X11/Xatom.h>
@@ -53,21 +54,26 @@ static int pipefd[2];
 static int display_width;
 static int display_height;
 
+/** Presents the latest decoded frame on the X11/EGL output path. */
 static int frame_handle(int pipefd) {
   AVFrame* frame = NULL;
+  uint64_t render_started_us;
   while (read(pipefd, &frame, sizeof(void*)) > 0);
   if (frame) {
+    render_started_us = LiGetMicroseconds();
     if (ffmpeg_decoder == SOFTWARE)
       egl_draw(frame->data);
     #ifdef HAVE_VAAPI
     else if (ffmpeg_decoder == VAAPI)
       vaapi_queue(frame, window, display_width, display_height);
     #endif
+    stats_overlay_runtime_note_render((LiGetMicroseconds() - render_started_us) / 1000.0);
   }
 
   return LOOP_OK;
 }
 
+/** Probes the X11 renderer path and chooses EGL or VAAPI when available. */
 int x11_init(bool vdpau, bool vaapi) {
   XInitThreads();
   display = XOpenDisplay(NULL);
@@ -82,6 +88,7 @@ int x11_init(bool vdpau, bool vaapi) {
   return INIT_EGL;
 }
 
+/** Initializes the X11 decode and presentation path. */
 int x11_setup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
   ensure_buf_size(&ffmpeg_buffer, &ffmpeg_buffer_size, INITIAL_DECODER_BUFFER_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
 
@@ -150,24 +157,30 @@ int x11_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   return 0;
 }
 
+/** Initializes the X11 decode path with VDPAU acceleration requested. */
 int x11_setup_vdpau(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
   return x11_setup(videoFormat, width, height, redrawRate, context, drFlags | X11_VDPAU_ACCELERATION);
 }
 
+/** Initializes the X11 decode path with VAAPI acceleration requested. */
 int x11_setup_vaapi(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
   return x11_setup(videoFormat, width, height, redrawRate, context, drFlags | X11_VAAPI_ACCELERATION);
 }
 
+/** Tears down the X11 decoder and EGL state. */
 void x11_cleanup() {
   ffmpeg_destroy();
   egl_destroy();
 }
 
+/** Decodes a video frame, updates live stats, and overlays text on software-decoded X11 frames. */
 int x11_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   PLENTRY entry = decodeUnit->bufferList;
   int length = 0;
+  uint64_t decode_started_us;
 
   ensure_buf_size(&ffmpeg_buffer, &ffmpeg_buffer_size, decodeUnit->fullLength + AV_INPUT_BUFFER_PADDING_SIZE);
+  stats_overlay_runtime_note_decode_unit(decodeUnit);
 
   while (entry != NULL) {
     memcpy(ffmpeg_buffer+length, entry->data, entry->length);
@@ -175,11 +188,18 @@ int x11_submit_decode_unit(PDECODE_UNIT decodeUnit) {
     entry = entry->next;
   }
 
+  decode_started_us = LiGetMicroseconds();
   ffmpeg_decode(ffmpeg_buffer, length);
 
   AVFrame* frame = ffmpeg_get_frame(true);
-  if (frame != NULL)
+  if (frame != NULL) {
+    stats_overlay_runtime_note_decoded_frame((LiGetMicroseconds() - decode_started_us) / 1000.0);
+    stats_overlay_runtime_refresh();
+    if (ffmpeg_decoder == SOFTWARE && stats_overlay_runtime_is_visible())
+      stats_overlay_draw_yuv420(frame->data, frame->linesize, frame->width, frame->height, stats_overlay_runtime_state());
+
     write(pipefd[1], &frame, sizeof(void*));
+  }
 
   return DR_OK;
 }

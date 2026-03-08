@@ -1,6 +1,8 @@
 #ifndef MOONLIGHT_STATS_OVERLAY_H
 #define MOONLIGHT_STATS_OVERLAY_H
 
+#include <Limelight.h>
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -79,8 +81,18 @@ void stats_overlay_session_start(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLA
 void stats_overlay_session_stop(PSTATS_OVERLAY_STATE state);
 bool stats_overlay_should_warn(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLAY_PREFERENCE pref, const PSTATS_OVERLAY_CAPABILITY capability);
 bool stats_overlay_update(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLAY_SNAPSHOT snapshot, uint64_t now_ms);
-size_t stats_overlay_measure_width(const PSTATS_OVERLAY_STATE state);
-size_t stats_overlay_measure_height(const PSTATS_OVERLAY_STATE state);
+size_t stats_overlay_measure_width(const STATS_OVERLAY_STATE* state);
+size_t stats_overlay_measure_height(const STATS_OVERLAY_STATE* state);
 void stats_overlay_clear_box(uint32_t* pixels, size_t stride_pixels, size_t width, size_t height, uint32_t color);
+void stats_overlay_draw_yuv420(uint8_t* const planes[3], const int linesize[3], int width, int height, const STATS_OVERLAY_STATE* state);
+
+void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const PSTATS_OVERLAY_CAPABILITY capability, int width, int height, double fps, const char* codec);
+void stats_overlay_runtime_stop(void);
+void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit);
+void stats_overlay_runtime_note_decoded_frame(double decode_time_ms);
+void stats_overlay_runtime_note_render(double render_time_ms);
+bool stats_overlay_runtime_refresh(void);
+const STATS_OVERLAY_STATE* stats_overlay_runtime_state(void);
+bool stats_overlay_runtime_is_visible(void);
 
 #endif

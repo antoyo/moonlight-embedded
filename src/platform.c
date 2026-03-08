@@ -269,12 +269,14 @@ void platform_get_overlay_capability(enum platform system, PSTATS_OVERLAY_CAPABI
   switch (system) {
   case SDL:
   case X11:
-  case X11_VDPAU:
-  case X11_VAAPI:
     stats_overlay_capability_init(capability, true, true, NULL);
     break;
   case AML:
     stats_overlay_capability_init(capability, false, false, "The AML backend does not support stats overlay compositing yet.");
+    break;
+  case X11_VDPAU:
+  case X11_VAAPI:
+    stats_overlay_capability_init(capability, false, true, "The selected X11 hardware-decoding backend cannot safely composite the stats overlay.");
     break;
   default:
     stats_overlay_capability_init(capability, false, false, "This backend does not support the stats overlay yet.");

@@ -54,9 +54,6 @@
 #include <arpa/inet.h>
 #include <openssl/rand.h>
 
-static STATS_OVERLAY_STATE stats_overlay_state;
-static STATS_OVERLAY_SNAPSHOT stats_overlay_snapshot;
-
 /** Prints the available app list returned by the host. */
 static void applist(PSERVER_DATA server) {
   PAPP_LIST list = NULL;
@@ -147,15 +144,12 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   }
 
   // Lock the overlay preference once the session is about to start so later config edits do not affect it.
-  stats_overlay_init(&stats_overlay_state);
-  stats_overlay_snapshot_init(&stats_overlay_snapshot);
-  stats_overlay_snapshot_set_stream(&stats_overlay_snapshot, config->stream.width, config->stream.height, config->stream.fps,
-      config->codec == CODEC_HEVC ? "HEVC" : config->codec == CODEC_AV1 ? "AV1" : "H264");
   platform_get_overlay_capability(system, &overlay_capability);
   stats_overlay_pref_lock(&config->stats_overlay);
-  stats_overlay_session_start(&stats_overlay_state, &config->stats_overlay, &overlay_capability);
+  stats_overlay_runtime_configure(&config->stats_overlay, &overlay_capability, config->stream.width, config->stream.height,
+      config->stream.fps, config->codec == CODEC_HEVC ? "HEVC" : config->codec == CODEC_AV1 ? "AV1" : "H264");
   connection_reset_stats_overlay_warning();
-  if (stats_overlay_should_warn(&stats_overlay_state, &config->stats_overlay, &overlay_capability))
+  if (!overlay_capability.supports_overlay && config->stats_overlay.enabled)
     connection_warn_stats_overlay_unsupported(overlay_capability.unsupported_reason);
 
   if (IS_EMBEDDED(system))
@@ -185,7 +179,7 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   }
 
   platform_stop(system);
-  stats_overlay_session_stop(&stats_overlay_state);
+  stats_overlay_runtime_stop();
   stats_overlay_pref_unlock(&config->stats_overlay);
 }
 

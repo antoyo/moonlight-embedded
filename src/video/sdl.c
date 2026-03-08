@@ -21,6 +21,7 @@
 #include "ffmpeg.h"
 
 #include "../sdl.h"
+#include "../stats_overlay.h"
 #include "../util.h"
 
 #include <SDL.h>
@@ -34,6 +35,7 @@
 static void* ffmpeg_buffer;
 static size_t ffmpeg_buffer_size;
 
+/** Initializes the SDL software decode path for streaming video. */
 static int sdl_setup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
   if (ffmpeg_init(videoFormat, width, height, SLICE_THREADING, SDL_BUFFER_FRAMES, SLICES_PER_FRAME) < 0) {
     fprintf(stderr, "Couldn't initialize video decoding\n");
@@ -45,26 +47,39 @@ static int sdl_setup(int videoFormat, int width, int height, int redrawRate, voi
   return 0;
 }
 
+/** Tears down the SDL software decode path. */
 static void sdl_cleanup() {
   ffmpeg_destroy();
 }
 
+/** Decodes a video frame, updates live stats, and overlays text on the YUV frame. */
 static int sdl_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   PLENTRY entry = decodeUnit->bufferList;
   int length = 0;
+  uint64_t decode_started_us;
 
   ensure_buf_size(&ffmpeg_buffer, &ffmpeg_buffer_size, decodeUnit->fullLength + AV_INPUT_BUFFER_PADDING_SIZE);
+
+  stats_overlay_runtime_note_decode_unit(decodeUnit);
 
   while (entry != NULL) {
     memcpy(ffmpeg_buffer+length, entry->data, entry->length);
     length += entry->length;
     entry = entry->next;
   }
+
+  decode_started_us = LiGetMicroseconds();
   ffmpeg_decode(ffmpeg_buffer, length);
 
   SDL_LockMutex(mutex);
   AVFrame* frame = ffmpeg_get_frame(false);
   if (frame != NULL) {
+    // Sample decoder throughput before the frame is handed to the SDL presenter thread.
+    stats_overlay_runtime_note_decoded_frame((LiGetMicroseconds() - decode_started_us) / 1000.0);
+    stats_overlay_runtime_refresh();
+    if (stats_overlay_runtime_is_visible())
+      stats_overlay_draw_yuv420(frame->data, frame->linesize, frame->width, frame->height, stats_overlay_runtime_state());
+
     sdlNextFrame++;
 
     SDL_Event event;

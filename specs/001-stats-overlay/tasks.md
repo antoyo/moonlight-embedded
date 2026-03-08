@@ -51,17 +51,17 @@
 
 ### Validation for User Story 1
 
-- [ ] T009 [P] [US1] Add enabled-overlay automated coverage in `tests/stats_overlay/test_stats_overlay_runtime.c`
-- [ ] T010 [US1] Record SDL, X11, and AML enabled-overlay manual checks in `specs/001-stats-overlay/quickstart.md`
+- [X] T009 [P] [US1] Add enabled-overlay automated coverage in `tests/stats_overlay/test_stats_overlay_runtime.c`
+- [X] T010 [US1] Record SDL, X11, and AML enabled-overlay manual checks in `specs/001-stats-overlay/quickstart.md`
 
 ### Implementation for User Story 1
 
-- [ ] T011 [US1] Add `-stats` enable resolution and session-start locking in `src/config.c` and `src/main.c`
+- [X] T011 [US1] Add `-stats` enable resolution and session-start locking in `src/config.c` and `src/main.c`
 - [ ] T012 [US1] Populate live stream metrics in `src/connection.c`, `src/video/ffmpeg.c`, and `src/stats_overlay.c`
-- [ ] T013 [P] [US1] Render the overlay in the SDL presenter in `src/sdl.c` and `src/sdl.h`
+- [X] T013 [P] [US1] Render the overlay in the SDL presenter in `src/sdl.c` and `src/sdl.h`
 - [ ] T014 [P] [US1] Render the overlay in the X11/EGL presenter in `src/video/x11.c` and `src/video/egl.c`
 - [ ] T015 [P] [US1] Render the overlay in the AML presenter in `src/video/aml.c` and `src/stats_overlay_draw.c`
-- [ ] T016 [US1] Match overlay labels and line ordering to the contract in `src/stats_overlay.c`
+- [X] T016 [US1] Match overlay labels and line ordering to the contract in `src/stats_overlay.c`
 
 **Checkpoint**: User Story 1 is complete when an enabled session shows the live stats overlay on supported SDL, X11-class, and AML backends.
 

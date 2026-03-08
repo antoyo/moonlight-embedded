@@ -20,6 +20,7 @@
 #ifdef HAVE_SDL
 
 #include "sdl.h"
+#include "stats_overlay.h"
 #include "input/sdl.h"
 
 #include <Limelight.h>
@@ -35,6 +36,7 @@ SDL_mutex *mutex;
 
 int sdlCurrentFrame, sdlNextFrame;
 
+/** Initializes the SDL windowing and renderer state for playback. */
 void sdl_init(int width, int height, bool fullscreen) {
   sdlCurrentFrame = sdlNextFrame = 0;
 
@@ -69,6 +71,7 @@ void sdl_init(int width, int height, bool fullscreen) {
   }
 }
 
+/** Runs the SDL event loop and presents decoded frames to the window. */
 void sdl_loop() {
   SDL_Event event;
 
@@ -101,11 +104,13 @@ void sdl_loop() {
           } else if (SDL_LockMutex(mutex) == 0) {
             Uint8** data = ((Uint8**) event.user.data1);
             int* linesize = ((int*) event.user.data2);
+            uint64_t render_started_us = LiGetMicroseconds();
             SDL_UpdateYUVTexture(bmp, NULL, data[0], linesize[0], data[1], linesize[1], data[2], linesize[2]);
             SDL_UnlockMutex(mutex);
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, bmp, NULL, NULL);
             SDL_RenderPresent(renderer);
+            stats_overlay_runtime_note_render((LiGetMicroseconds() - render_started_us) / 1000.0);
           } else
             fprintf(stderr, "Couldn't lock mutex\n");
         }

@@ -1,14 +1,47 @@
 #include "stats_overlay.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+
+typedef struct _STATS_OVERLAY_WINDOW {
+  uint64_t started_at_ms;
+  unsigned int incoming_frames;
+  unsigned int decoded_frames;
+  unsigned int rendered_frames;
+  double decode_time_total_ms;
+  double render_time_total_ms;
+  double queue_delay_total_ms;
+  unsigned int queue_delay_count;
+  double host_latency_total_ms;
+  unsigned int host_latency_count;
+  double host_latency_min_ms;
+  double host_latency_max_ms;
+  RTP_VIDEO_STATS last_video_stats;
+  bool have_last_video_stats;
+} STATS_OVERLAY_WINDOW, *PSTATS_OVERLAY_WINDOW;
+
+static pthread_mutex_t stats_overlay_runtime_mutex = PTHREAD_MUTEX_INITIALIZER;
+static STATS_OVERLAY_STATE stats_overlay_runtime_state_data;
+static STATS_OVERLAY_SNAPSHOT stats_overlay_runtime_snapshot;
+static STATS_OVERLAY_PREFERENCE stats_overlay_runtime_pref;
+static STATS_OVERLAY_CAPABILITY stats_overlay_runtime_capability;
+static STATS_OVERLAY_WINDOW stats_overlay_runtime_window;
 
 /** Returns the current wall-clock time in milliseconds for cache timestamps. */
 static uint64_t stats_overlay_now_ms(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
   return ((uint64_t) tv.tv_sec * 1000ULL) + ((uint64_t) tv.tv_usec / 1000ULL);
+}
+
+/** Resets the rolling metric window used for overlay refresh calculations. */
+static void stats_overlay_window_reset(PSTATS_OVERLAY_WINDOW window, uint64_t now_ms) {
+  memset(window, 0, sizeof(*window));
+  window->started_at_ms = now_ms;
+  window->host_latency_min_ms = 0.0;
+  window->host_latency_max_ms = 0.0;
 }
 
 /** Formats a metric value or the required Unavailable placeholder. */
@@ -163,4 +196,181 @@ bool stats_overlay_update(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLAY_SNAPS
   state->line_count = STATS_OVERLAY_MAX_LINES;
   state->last_format_ms = now_ms;
   return true;
+}
+
+/** Configures the shared runtime overlay state for a newly starting session. */
+void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const PSTATS_OVERLAY_CAPABILITY capability, int width, int height, double fps, const char* codec) {
+  uint64_t now_ms = stats_overlay_now_ms();
+
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  stats_overlay_runtime_pref = *pref;
+  stats_overlay_runtime_capability = *capability;
+  stats_overlay_init(&stats_overlay_runtime_state_data);
+  stats_overlay_snapshot_init(&stats_overlay_runtime_snapshot);
+  stats_overlay_snapshot_set_stream(&stats_overlay_runtime_snapshot, width, height, fps, codec);
+  stats_overlay_session_start(&stats_overlay_runtime_state_data, &stats_overlay_runtime_pref, &stats_overlay_runtime_capability);
+  stats_overlay_window_reset(&stats_overlay_runtime_window, now_ms);
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Stops and clears the shared runtime overlay state after a session ends. */
+void stats_overlay_runtime_stop(void) {
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  stats_overlay_session_stop(&stats_overlay_runtime_state_data);
+  stats_overlay_window_reset(&stats_overlay_runtime_window, 0);
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Records incoming frame timing information from the assembled decode unit. */
+void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit) {
+  uint64_t now_us = LiGetMicroseconds();
+  double host_latency_ms = decode_unit->frameHostProcessingLatency / 10.0;
+
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  stats_overlay_runtime_window.incoming_frames++;
+
+  if (decode_unit->enqueueTimeUs != 0 && now_us >= decode_unit->enqueueTimeUs) {
+    stats_overlay_runtime_window.queue_delay_total_ms += (now_us - decode_unit->enqueueTimeUs) / 1000.0;
+    stats_overlay_runtime_window.queue_delay_count++;
+  }
+
+  if (decode_unit->frameHostProcessingLatency != 0) {
+    // Track min/max/average from the host-supplied per-frame latency sample.
+    if (stats_overlay_runtime_window.host_latency_count == 0 || host_latency_ms < stats_overlay_runtime_window.host_latency_min_ms)
+      stats_overlay_runtime_window.host_latency_min_ms = host_latency_ms;
+    if (stats_overlay_runtime_window.host_latency_count == 0 || host_latency_ms > stats_overlay_runtime_window.host_latency_max_ms)
+      stats_overlay_runtime_window.host_latency_max_ms = host_latency_ms;
+
+    stats_overlay_runtime_window.host_latency_total_ms += host_latency_ms;
+    stats_overlay_runtime_window.host_latency_count++;
+  }
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Records a decoded frame and its measured decoder cost. */
+void stats_overlay_runtime_note_decoded_frame(double decode_time_ms) {
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  stats_overlay_runtime_window.decoded_frames++;
+  stats_overlay_runtime_window.decode_time_total_ms += decode_time_ms;
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Records a presented frame and its measured render cost. */
+void stats_overlay_runtime_note_render(double render_time_ms) {
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  stats_overlay_runtime_window.rendered_frames++;
+  stats_overlay_runtime_window.render_time_total_ms += render_time_ms;
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Refreshes live metrics from the rolling counters and Moonlight transport APIs. */
+bool stats_overlay_runtime_refresh(void) {
+  uint64_t now_ms = stats_overlay_now_ms();
+  uint32_t rtt = 0;
+  uint32_t rtt_variance = 0;
+  const RTP_VIDEO_STATS* video_stats = LiGetRTPVideoStats();
+  bool updated = false;
+
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  if (!stats_overlay_runtime_state_data.visible) {
+    pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+    return false;
+  }
+
+  if (stats_overlay_runtime_window.started_at_ms == 0)
+    stats_overlay_runtime_window.started_at_ms = now_ms;
+
+  if (now_ms >= stats_overlay_runtime_window.started_at_ms + stats_overlay_runtime_state_data.refresh_interval_ms) {
+    double elapsed_seconds = (now_ms - stats_overlay_runtime_window.started_at_ms) / 1000.0;
+
+    if (elapsed_seconds > 0.0) {
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.incoming_network_fps, true,
+          stats_overlay_runtime_window.incoming_frames / elapsed_seconds);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.decoding_fps, true,
+          stats_overlay_runtime_window.decoded_frames / elapsed_seconds);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.rendering_fps, true,
+          stats_overlay_runtime_window.rendered_frames / elapsed_seconds);
+    }
+
+    // Populate averages only when samples exist so the overlay can still render Unavailable placeholders.
+    stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.decode_time_avg_ms,
+        stats_overlay_runtime_window.decoded_frames != 0,
+        stats_overlay_runtime_window.decoded_frames != 0 ?
+            stats_overlay_runtime_window.decode_time_total_ms / stats_overlay_runtime_window.decoded_frames : 0.0);
+    stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.render_time_avg_ms,
+        stats_overlay_runtime_window.rendered_frames != 0,
+        stats_overlay_runtime_window.rendered_frames != 0 ?
+            stats_overlay_runtime_window.render_time_total_ms / stats_overlay_runtime_window.rendered_frames : 0.0);
+    stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.queue_delay_avg_ms,
+        stats_overlay_runtime_window.queue_delay_count != 0,
+        stats_overlay_runtime_window.queue_delay_count != 0 ?
+            stats_overlay_runtime_window.queue_delay_total_ms / stats_overlay_runtime_window.queue_delay_count : 0.0);
+
+    if (stats_overlay_runtime_window.host_latency_count != 0) {
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_min_ms, true, stats_overlay_runtime_window.host_latency_min_ms);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_max_ms, true, stats_overlay_runtime_window.host_latency_max_ms);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_avg_ms, true,
+          stats_overlay_runtime_window.host_latency_total_ms / stats_overlay_runtime_window.host_latency_count);
+    } else {
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_min_ms, false, 0.0);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_max_ms, false, 0.0);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_avg_ms, false, 0.0);
+    }
+
+    if (video_stats != NULL && stats_overlay_runtime_window.have_last_video_stats) {
+      uint32_t delta_total = (video_stats->packetCountVideo + video_stats->packetCountFec) -
+          (stats_overlay_runtime_window.last_video_stats.packetCountVideo + stats_overlay_runtime_window.last_video_stats.packetCountFec);
+      uint32_t delta_failed = video_stats->packetCountFecFailed - stats_overlay_runtime_window.last_video_stats.packetCountFecFailed;
+      uint32_t delta_oos = video_stats->packetCountOOS - stats_overlay_runtime_window.last_video_stats.packetCountOOS;
+
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_drop_pct, delta_total != 0,
+          delta_total != 0 ? (delta_failed * 100.0) / delta_total : 0.0);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.jitter_drop_pct, delta_total != 0,
+          delta_total != 0 ? (delta_oos * 100.0) / delta_total : 0.0);
+    } else {
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_drop_pct, false, 0.0);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.jitter_drop_pct, false, 0.0);
+    }
+
+    if (video_stats != NULL) {
+      stats_overlay_runtime_window.last_video_stats = *video_stats;
+      stats_overlay_runtime_window.have_last_video_stats = true;
+    }
+
+    if (LiGetEstimatedRttInfo(&rtt, &rtt_variance)) {
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_avg_ms, true, rtt / 2.0);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_variance_ms, true, rtt_variance / 2.0);
+    } else {
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_avg_ms, false, 0.0);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_variance_ms, false, 0.0);
+    }
+
+    stats_overlay_window_reset(&stats_overlay_runtime_window, now_ms);
+  }
+
+  updated = stats_overlay_update(&stats_overlay_runtime_state_data, &stats_overlay_runtime_snapshot, now_ms);
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+  return updated;
+}
+
+/** Returns the current cached runtime overlay state for renderers. */
+const STATS_OVERLAY_STATE* stats_overlay_runtime_state(void) {
+  return &stats_overlay_runtime_state_data;
+}
+
+/** Returns whether the current session should display the overlay. */
+bool stats_overlay_runtime_is_visible(void) {
+  return stats_overlay_runtime_state_data.visible;
 }

@@ -37,14 +37,14 @@ Disable for one session even if a config file enables it:
 
 ## Manual Validation Flow
 
-1. Start a stream with `-stats` on an SDL or X11-class backend.
-2. Confirm the overlay appears in the top-left within 5 seconds.
-3. Confirm the overlay shows the full metric list in stable line order.
-4. Confirm missing metrics render as `Unavailable` without collapsing the line list.
+1. Start a stream with `-stats -platform sdl` and confirm the overlay appears in the top-left within 5 seconds.
+2. Confirm the SDL overlay shows the full metric list in stable line order while values continue updating during playback.
+3. Start a stream with `-stats -platform x11` and confirm the same top-left overlay appears and keeps the same label order.
+4. Confirm missing metrics render as `Unavailable` without collapsing the line list on both SDL and X11.
 5. Change the config value while the stream is active and confirm the current session does not change.
 6. Start a new session and confirm the updated value applies.
 7. Start a session with `-nostats` and confirm no overlay or placeholder is rendered.
-8. Test at least one embedded backend; if overlay drawing is unsupported there, confirm the stream continues and a single capability warning is emitted.
+8. Start a stream with `-stats -platform aml`; confirm the stream continues and a single unsupported-backend warning is emitted instead of drawing text.
 
 ## Performance Validation
 

@@ -30,6 +30,10 @@ int main(void) {
   assert(stats_overlay_measure_width(&state) > 0);
   assert(stats_overlay_measure_height(&state) == STATS_OVERLAY_MAX_LINES * 8);
   assert(strstr(state.formatted_lines[10], "Unavailable") != NULL);
+  assert(strcmp(state.formatted_lines[0], "Video stream: 1920x1080 60.00 FPS (Codec: HEVC)") == 0);
+  assert(strcmp(state.formatted_lines[1], "Incoming frame rate from network: Unavailable") == 0);
+  assert(strcmp(state.formatted_lines[2], "Decoding frame rate: 59.50") == 0);
+  assert(strcmp(state.formatted_lines[3], "Rendering frame rate: 60.00") == 0);
 
   assert(stats_overlay_update(&state, &snapshot, 1200) == false);
   assert(stats_overlay_update(&state, &snapshot, 1600) == true);
