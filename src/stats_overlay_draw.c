@@ -169,11 +169,46 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
     uint32_t fg_color, uint32_t bg_color) {
   int margin = 8 * STATS_OVERLAY_FONT_SCALE;
   int line;
+  int text_width = (int)stats_overlay_measure_width(state);
+  int text_height = (int)stats_overlay_measure_height(state);
+  int clear_width = (STATS_OVERLAY_MAX_LINE_LENGTH * STATS_OVERLAY_FONT_WIDTH) + (8 * STATS_OVERLAY_FONT_SCALE);
+  int clear_height = (STATS_OVERLAY_MAX_LINES * STATS_OVERLAY_FONT_HEIGHT) + (8 * STATS_OVERLAY_FONT_SCALE);
+  int row;
 
   if (state->line_count == 0 || pixels == NULL || stride_pixels == 0)
     return;
 
-  (void) bg_color;
+  // Clear the full reserved overlay region so shorter lines do not leave stale pixels behind on the OSD plane.
+  for (row = 0; row < clear_height; row++) {
+    int draw_y = (margin - (4 * STATS_OVERLAY_FONT_SCALE)) + row;
+    int col;
+
+    if (draw_y < 0 || draw_y >= height)
+      continue;
+
+    for (col = 0; col < clear_width; col++) {
+      int draw_x = (margin - (4 * STATS_OVERLAY_FONT_SCALE)) + col;
+
+      if (draw_x >= 0 && draw_x < width)
+        pixels[(draw_y * stride_pixels) + draw_x] = 0;
+    }
+  }
+
+  // Draw a stable translucent backing box behind the current text block for readability over bright video.
+  for (row = 0; row < text_height + (8 * STATS_OVERLAY_FONT_SCALE); row++) {
+    int draw_y = (margin - (4 * STATS_OVERLAY_FONT_SCALE)) + row;
+    int col;
+
+    if (draw_y < 0 || draw_y >= height)
+      continue;
+
+    for (col = 0; col < text_width + (8 * STATS_OVERLAY_FONT_SCALE); col++) {
+      int draw_x = (margin - (4 * STATS_OVERLAY_FONT_SCALE)) + col;
+
+      if (draw_x >= 0 && draw_x < width)
+        pixels[(draw_y * stride_pixels) + draw_x] = bg_color;
+    }
+  }
 
   for (line = 0; line < (int) state->line_count; line++) {
     int x = margin;
