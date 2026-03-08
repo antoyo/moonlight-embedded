@@ -5,15 +5,23 @@
 **Status**: Draft  
 **Input**: User description: "I want to add the following feature to this project: real-time stats output at the top-left of the screen, similar to what you can get in moonlight-qt. This should only be shown when the config for that is enabled." Additional user-provided example output defines the expected metric set and display content.
 
+## Clarifications
+
+### Session 2026-03-08
+
+- Q: How should users enable the stats overlay? → A: Config file plus a command-line flag that follows existing precedence rules.
+- Q: When a required metric is temporarily unavailable, how should the overlay handle that line? → A: Keep the full metric list visible and show Unavailable for missing values.
+- Q: Should users be able to toggle the stats overlay during an active streaming session? → A: No, it is decided before the session starts and changes apply on the next session.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Monitor Session Health (Priority: P1)
 
-A user who wants immediate visibility into stream quality enables stats output in configuration and starts a streaming session. The user can then see a compact panel of live session metrics in the top-left corner while playing.
+A user who wants immediate visibility into stream quality enables stats output before starting a streaming session. The user can then see a compact panel of live session metrics in the top-left corner while playing.
 
 **Why this priority**: The primary value of the feature is giving users instant feedback about stream performance without leaving the session or guessing why quality changes occur.
 
-**Independent Test**: Enable the stats setting, start a stream, and verify that a compact stats panel appears in the top-left of the visible video area and updates while the session is active.
+**Independent Test**: Enable the stats setting before starting a stream, start the session, and verify that a compact stats panel appears in the top-left of the visible video area and updates while the session is active.
 
 **Acceptance Scenarios**:
 
@@ -21,6 +29,7 @@ A user who wants immediate visibility into stream quality enables stats output i
 2. **Given** stats output is enabled and all expected telemetry is available, **When** the panel is shown, **Then** it displays labeled values for stream resolution, stream frame rate, codec, incoming network frame rate, decoding frame rate, rendering frame rate, host processing latency minimum/maximum/average, network drop rate, jitter drop rate, average network latency with variance, average decoding time, average queue delay, and average rendering time.
 3. **Given** stats output is enabled and a stream is active, **When** frame rate, bitrate, latency, or packet quality changes, **Then** the panel reflects the updated values within 2 seconds.
 4. **Given** stats output is enabled, **When** the streaming session ends, **Then** the stats panel disappears with the session output.
+5. **Given** a stream is already active, **When** the user changes the stats-overlay setting outside the current session, **Then** the current session's overlay state does not change and the new setting applies on the next session start.
 
 ---
 
@@ -49,7 +58,7 @@ A user with stats enabled still receives a stable overlay even when some metrics
 
 **Acceptance Scenarios**:
 
-1. **Given** stats output is enabled and one or more metrics are unavailable, **When** the overlay refreshes, **Then** available values continue updating and unavailable values are clearly identified as unavailable.
+1. **Given** stats output is enabled and one or more metrics are unavailable, **When** the overlay refreshes, **Then** the full metric list remains visible, available values continue updating, and each missing value is shown as `Unavailable`.
 2. **Given** stats output is enabled and the visible video area changes because of rotation, resizing, or display mode changes, **When** the overlay is redrawn, **Then** it remains anchored to the top-left of the visible video area without extending off-screen.
 
 ### Edge Cases
@@ -60,13 +69,15 @@ A user with stats enabled still receives a stable overlay even when some metrics
 - The stream is shown on a small display where a large overlay could obscure gameplay.
 - Multiple configuration sources are loaded and the final resolved setting differs from the base configuration file.
 - Some metrics may legitimately remain at zero or near-zero values during a healthy session and must still be displayed as valid readings.
+- A temporarily unavailable metric must keep its normal position in the overlay so the displayed line order remains stable.
 
 ## Requirements *(mandatory)*
 
 ### Functional Requirements
 
-- **FR-001**: The system MUST provide a user-configurable setting that enables or disables on-screen real-time streaming stats for a session.
+- **FR-001**: The system MUST provide both a configuration-file setting and a command-line flag that enable or disable on-screen real-time streaming stats for a session.
 - **FR-002**: The default behavior MUST keep the stats overlay hidden unless the resolved configuration explicitly enables it.
+- **FR-002a**: The resolved stats-overlay setting for a session MUST be determined before streaming begins and MUST remain unchanged for the duration of that session.
 - **FR-003**: When enabled, the system MUST display a compact stats panel anchored to the top-left of the visible video area during active streaming sessions.
 - **FR-004**: The stats panel MUST present a consistent multi-line, labeled, human-readable summary of live stream-health metrics while the session is active.
 - **FR-005**: When the underlying telemetry is available, the stats panel MUST display all of the following metric categories:
@@ -82,10 +93,10 @@ A user with stats enabled still receives a stable overlay even when some metrics
   - average queue delay
   - average rendering time, including display synchronization delay
 - **FR-006**: When enabled, the stats panel MUST refresh often enough that significant metric changes are reflected within 2 seconds.
-- **FR-007**: If an individual metric is unavailable, the system MUST continue the session and clearly indicate that the affected value is unavailable instead of showing stale or misleading data.
+- **FR-007**: If an individual metric is unavailable, the system MUST continue the session, keep the full metric list visible, and show `Unavailable` for the affected value instead of showing stale or misleading data.
 - **FR-008**: The overlay MUST remain fully within the visible video area, remain readable across supported display modes, and occupy no more than 15% of the visible screen width or 10% of the visible screen height.
 - **FR-009**: When stats output is disabled, the system MUST not render any stats text, placeholder region, or other persistent visual artifact during startup, active streaming, or shutdown.
-- **FR-010**: Existing configuration precedence rules MUST determine whether stats output is shown when multiple configuration sources are used, and the user-facing documentation MUST explain how to enable and disable the feature.
+- **FR-010**: Existing configuration precedence rules MUST determine whether stats output is shown when configuration files and command-line input specify different values, and the user-facing documentation MUST explain how to enable and disable the feature through both paths.
 - **FR-011**: Any platform-specific limitation that prevents the overlay from being shown MUST fail gracefully by preserving the stream session and clearly documenting the limitation.
 - **FR-012**: Enabling stats output MUST not reduce achieved stream frame rate or increase user-observable latency by more than 2% during equivalent 30-minute comparison sessions.
 - **FR-013**: Help text, sample configuration, and user-facing documentation MUST describe the setting, the overlay behavior, and the meaning of each displayed metric.
@@ -119,6 +130,8 @@ Average rendering time (including monitor V-sync latency): 0.30 ms
 - The feature applies to active streaming sessions and does not affect pairing, listing, quitting, or input-mapping commands.
 - The overlay is passive and informational only; users are not expected to interact with it while streaming.
 - The feature uses the existing project configuration workflow and remains disabled by default to preserve current behavior.
+- The resolved stats-overlay setting is determined before the stream starts using the project's existing command-line and configuration precedence rules.
+- Changing the stats-overlay setting during an active session does not affect the current session and takes effect only on the next stream start.
 
 ## Success Criteria *(mandatory)*
 
