@@ -31,7 +31,19 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+- **CLI and config compatibility**: Identify every user-visible command, flag,
+  config key, or protocol behavior touched by this feature. State whether the
+  change is backward compatible and list the docs that must be updated.
+- **Platform isolation**: List the impacted backends in `src/audio/`,
+  `src/video/`, `src/input/`, `libgamestream/`, or CMake feature flags. Explain
+  how unrelated platforms remain unaffected.
+- **Streaming performance**: If the feature touches pairing, discovery,
+  streaming, decode, render, audio sync, input handling, or packet flow, state
+  the expected latency/resource impact and the regression signals to watch.
+- **Validation plan**: Define the automated coverage and the manual host or
+  hardware checks required to verify the changed behavior.
+- **Documentation sync**: Confirm whether `README.md`, `docs/README.pod`,
+  `moonlight.conf`, contributor guidance, or install docs require updates.
 
 ## Project Structure
 

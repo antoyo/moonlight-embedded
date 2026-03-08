@@ -67,13 +67,12 @@
 
 ### Edge Cases
 
-<!--
-  ACTION REQUIRED: The content in this section represents placeholders.
-  Fill them out with the right edge cases.
--->
-
-- What happens when [boundary condition]?
-- How does system handle [error scenario]?
+- What happens when the selected host, backend, codec, or dependency is not
+  available on the target system?
+- How does the system fail when a command-line flag, config value, or protocol
+  response is invalid or unsupported?
+- What compatibility risks exist for existing users, paired hosts, or
+  platform-specific backends?
 
 ## Requirements *(mandatory)*
 
@@ -89,11 +88,19 @@
 - **FR-003**: Users MUST be able to [key interaction, e.g., "reset their password"]
 - **FR-004**: System MUST [data requirement, e.g., "persist user preferences"]
 - **FR-005**: System MUST [behavior, e.g., "log all security events"]
+- **FR-006**: Any change to CLI flags, config files, or protocol interactions
+  MUST state whether it is backward compatible and what documentation changes
+  are required.
+- **FR-007**: Any change that affects a platform backend MUST identify the
+  impacted audio, video, input, or build targets and define how unaffected
+  platforms continue to work.
+- **FR-008**: Any latency-sensitive change MUST define the expected performance
+  impact and the validation method for detecting regressions.
 
 *Example of marking unclear requirements:*
 
-- **FR-006**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
-- **FR-007**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
+- **FR-009**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
+- **FR-010**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
 
 ### Key Entities *(include if feature involves data)*
 
@@ -113,3 +120,5 @@
 - **SC-002**: [Measurable metric, e.g., "System handles 1000 concurrent users without degradation"]
 - **SC-003**: [User satisfaction metric, e.g., "90% of users successfully complete primary task on first attempt"]
 - **SC-004**: [Business metric, e.g., "Reduce support tickets related to [X] by 50%"]
+- **SC-005**: Documentation, help text, and configuration guidance affected by
+  the feature are updated in the same change set.
