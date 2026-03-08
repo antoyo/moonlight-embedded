@@ -54,6 +54,7 @@ static int overlayFd = -1;
 static uint32_t* overlayPixels = NULL;
 static size_t overlayMapSize = 0;
 static size_t overlayStridePixels = 0;
+static size_t overlayPageCount = 0;
 static int overlayWidth = 0;
 static int overlayHeight = 0;
 static bool overlayEnabled = false;
@@ -104,6 +105,28 @@ static void aml_clear_overlay(void) {
     memset(overlayPixels, 0, overlayMapSize);
 }
 
+/** Returns the number of vertically stacked framebuffer pages exposed by the AML OSD plane. */
+static size_t aml_overlay_page_count(const struct fb_var_screeninfo* var) {
+  if (var->yres == 0 || var->yres_virtual <= var->yres)
+    return 1;
+
+  // Android-style fbdev stacks commonly expose double or triple buffering by stacking pages vertically.
+  return (var->yres_virtual + var->yres - 1) / var->yres;
+}
+
+/** Returns true when a framebuffer page lies fully inside the mapped AML OSD memory. */
+static bool aml_overlay_page_fits(size_t page_index) {
+  size_t page_row_offset = page_index * (size_t) overlayHeight * overlayStridePixels;
+  size_t page_pixel_count;
+
+  if (overlayPixels == NULL || overlayStridePixels == 0 || overlayHeight <= 0)
+    return false;
+
+  // The last row start plus one visible page must stay inside the mmap or we risk scribbling past the buffer.
+  page_pixel_count = page_row_offset + ((size_t) overlayHeight * overlayStridePixels);
+  return page_pixel_count <= overlayMapSize / sizeof(*overlayPixels);
+}
+
 /** Opens and maps an AML OSD framebuffer for stats overlay composition. */
 static bool aml_overlay_init(void) {
   static const char* devices[] = { "/dev/fb0" };
@@ -137,6 +160,7 @@ static bool aml_overlay_init(void) {
 
     overlayFd = fd;
     overlayStridePixels = fix.line_length / sizeof(uint32_t);
+    overlayPageCount = aml_overlay_page_count(&var);
     overlayWidth = var.xres;
     overlayHeight = var.yres;
     overlayFgColor = aml_pack_fb_color(&var, 255, 255, 255, 255);
@@ -164,21 +188,36 @@ static void aml_overlay_destroy(void) {
   }
   overlayMapSize = 0;
   overlayStridePixels = 0;
+  overlayPageCount = 0;
   overlayWidth = 0;
   overlayHeight = 0;
 }
 
 /** Draws the current stats overlay into the AML OSD framebuffer. */
 static void aml_overlay_render(void) {
+  size_t page_index;
+
   if (!overlayEnabled || !overlayReady || overlayPixels == NULL)
     return;
 
   // Refresh the formatted stats text on its normal cadence, but repaint the cached overlay every frame so
   // AML video-plane updates cannot leave the OSD temporarily blank between metric refreshes.
   stats_overlay_runtime_refresh();
-  if (stats_overlay_runtime_is_visible())
-    stats_overlay_draw_argb32(overlayPixels, overlayStridePixels, overlayWidth, overlayHeight,
+  if (!stats_overlay_runtime_is_visible())
+    return;
+
+  // Some Amlogic fbdev stacks expose double or triple buffered OSD pages using yres_virtual/yoffset.
+  // Mirror the cached overlay into every page so page flips cannot hide it between frames.
+  for (page_index = 0; page_index < (overlayPageCount != 0 ? overlayPageCount : 1); page_index++) {
+    uint32_t* page_pixels;
+
+    if (!aml_overlay_page_fits(page_index))
+      break;
+
+    page_pixels = overlayPixels + (page_index * (size_t) overlayHeight * overlayStridePixels);
+    stats_overlay_draw_argb32(page_pixels, overlayStridePixels, overlayWidth, overlayHeight,
         stats_overlay_runtime_state(), overlayFgColor, overlayBgColor);
+  }
 }
 
 /** Drains AML display buffers and refreshes the OSD overlay once per presented frame. */
