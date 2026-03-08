@@ -106,8 +106,8 @@ static void aml_clear_overlay(void) {
 
 /** Opens and maps an AML OSD framebuffer for stats overlay composition. */
 static bool aml_overlay_init(void) {
-  static const char* devices[] = { "/dev/fb1", "/dev/fb0" };
-  static const char* blank_paths[] = { "/sys/class/graphics/fb1/blank", "/sys/class/graphics/fb0/blank" };
+  static const char* devices[] = { "/dev/fb0" };
+  static const char* blank_paths[] = { "/sys/class/graphics/fb0/blank" };
   size_t i;
 
   for (i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
@@ -126,6 +126,7 @@ static bool aml_overlay_init(void) {
       continue;
     }
 
+    // Some AML kernels leave smem_len unset, so derive the mapping size from the virtual height when needed.
     overlayMapSize = fix.smem_len != 0 ? fix.smem_len : (size_t) fix.line_length * var.yres_virtual;
     overlayPixels = mmap(NULL, overlayMapSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (overlayPixels == MAP_FAILED) {
@@ -141,7 +142,7 @@ static bool aml_overlay_init(void) {
     overlayFgColor = aml_pack_fb_color(&var, 255, 255, 255, 255);
     overlayBgColor = aml_pack_fb_color(&var, 0, 0, 0, var.transp.length != 0 ? 160 : 255);
 
-    // Unblank the OSD framebuffer selected for overlay composition.
+    // The AML video plane is separate from fb0, so keep fb0 visible for OSD composition.
     write_bool((char*) blank_paths[i], false);
     aml_clear_overlay();
     return true;
