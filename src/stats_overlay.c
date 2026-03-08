@@ -209,6 +209,9 @@ void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const
   stats_overlay_init(&stats_overlay_runtime_state_data);
   stats_overlay_snapshot_init(&stats_overlay_runtime_snapshot);
   stats_overlay_snapshot_set_stream(&stats_overlay_runtime_snapshot, width, height, fps, codec);
+  // A session starts with no observed packet drops, so the drop percentages should begin at 0.00%.
+  stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_drop_pct, true, 0.0);
+  stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.jitter_drop_pct, true, 0.0);
   stats_overlay_session_start(&stats_overlay_runtime_state_data, &stats_overlay_runtime_pref, &stats_overlay_runtime_capability);
   stats_overlay_window_reset(&stats_overlay_runtime_window, now_ms);
 
@@ -349,8 +352,9 @@ bool stats_overlay_runtime_refresh(void) {
           // Treat out-of-sequence packet growth as the jitter-related loss ratio for the same packet window.
           delta_total != 0 ? (delta_oos * 100.0) / delta_total : 0.0);
     } else {
-      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_drop_pct, false, 0.0);
-      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.jitter_drop_pct, false, 0.0);
+      // If we have not observed any packet-loss window yet, keep showing 0.00% rather than Unavailable.
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_drop_pct, true, 0.0);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.jitter_drop_pct, true, 0.0);
     }
 
     if (video_stats != NULL) {

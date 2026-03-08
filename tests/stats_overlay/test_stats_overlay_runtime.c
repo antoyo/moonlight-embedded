@@ -1,4 +1,5 @@
 #include "stats_overlay.h"
+#include "stats_overlay_font.h"
 
 #include <assert.h>
 #include <string.h>
@@ -28,7 +29,7 @@ int main(void) {
   assert(strstr(state.formatted_lines[2], "59.50") != NULL);
   assert(strstr(state.formatted_lines[3], "60.00") != NULL);
   assert(stats_overlay_measure_width(&state) > 0);
-  assert(stats_overlay_measure_height(&state) == STATS_OVERLAY_MAX_LINES * 8);
+  assert(stats_overlay_measure_height(&state) == STATS_OVERLAY_MAX_LINES * STATS_OVERLAY_FONT_HEIGHT);
   assert(strstr(state.formatted_lines[10], "Unavailable") != NULL);
   assert(strcmp(state.formatted_lines[0], "Video stream: 1920x1080 60.00 FPS (Codec: HEVC)") == 0);
   assert(strcmp(state.formatted_lines[1], "Incoming frame rate from network: Unavailable") == 0);
