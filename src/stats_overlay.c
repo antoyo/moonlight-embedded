@@ -10,6 +10,9 @@ typedef struct _STATS_OVERLAY_WINDOW {
   unsigned int incoming_frames;
   unsigned int decoded_frames;
   unsigned int rendered_frames;
+  uint64_t last_presentation_time_us;
+  double stream_frame_interval_total_us;
+  unsigned int stream_frame_interval_count;
   double decode_time_total_ms;
   double render_time_total_ms;
   double queue_delay_total_ms;
@@ -20,6 +23,9 @@ typedef struct _STATS_OVERLAY_WINDOW {
   double host_latency_max_ms;
   RTP_VIDEO_STATS last_video_stats;
   bool have_last_video_stats;
+  uint64_t pending_enqueue_times_us[256];
+  unsigned int pending_enqueue_head;
+  unsigned int pending_enqueue_count;
 } STATS_OVERLAY_WINDOW, *PSTATS_OVERLAY_WINDOW;
 
 static pthread_mutex_t stats_overlay_runtime_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -42,6 +48,34 @@ static void stats_overlay_window_reset(PSTATS_OVERLAY_WINDOW window, uint64_t no
   window->started_at_ms = now_ms;
   window->host_latency_min_ms = 0.0;
   window->host_latency_max_ms = 0.0;
+}
+
+/** Queues a frame-enqueue timestamp so the eventual present path can measure queue delay. */
+static void stats_overlay_window_push_enqueue_time(PSTATS_OVERLAY_WINDOW window, uint64_t enqueue_time_us) {
+  unsigned int index;
+
+  if (enqueue_time_us == 0)
+    return;
+
+  if (window->pending_enqueue_count == (sizeof(window->pending_enqueue_times_us) / sizeof(window->pending_enqueue_times_us[0]))) {
+    window->pending_enqueue_head = (window->pending_enqueue_head + 1) % (sizeof(window->pending_enqueue_times_us) / sizeof(window->pending_enqueue_times_us[0]));
+    window->pending_enqueue_count--;
+  }
+
+  index = (window->pending_enqueue_head + window->pending_enqueue_count) % (sizeof(window->pending_enqueue_times_us) / sizeof(window->pending_enqueue_times_us[0]));
+  window->pending_enqueue_times_us[index] = enqueue_time_us;
+  window->pending_enqueue_count++;
+}
+
+/** Pops the oldest queued enqueue timestamp when a frame reaches presentation. */
+static bool stats_overlay_window_pop_enqueue_time(PSTATS_OVERLAY_WINDOW window, uint64_t* enqueue_time_us) {
+  if (window->pending_enqueue_count == 0)
+    return false;
+
+  *enqueue_time_us = window->pending_enqueue_times_us[window->pending_enqueue_head];
+  window->pending_enqueue_head = (window->pending_enqueue_head + 1) % (sizeof(window->pending_enqueue_times_us) / sizeof(window->pending_enqueue_times_us[0]));
+  window->pending_enqueue_count--;
+  return true;
 }
 
 /** Formats a metric value or the required Unavailable placeholder. */
@@ -174,10 +208,10 @@ bool stats_overlay_update(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLAY_SNAPS
   format_value(buffer_c, sizeof(buffer_c), &snapshot->host_latency_avg_ms, " ms");
   snprintf(state->formatted_lines[4], sizeof(state->formatted_lines[4]), "Host processing latency min/max/average: %s/%s/%s", buffer_a, buffer_b, buffer_c);
 
-  format_value(buffer_a, sizeof(buffer_a), &snapshot->network_drop_pct, "%%");
+  format_value(buffer_a, sizeof(buffer_a), &snapshot->network_drop_pct, "%");
   snprintf(state->formatted_lines[5], sizeof(state->formatted_lines[5]), "Frames dropped by your network connection: %s", buffer_a);
 
-  format_value(buffer_a, sizeof(buffer_a), &snapshot->jitter_drop_pct, "%%");
+  format_value(buffer_a, sizeof(buffer_a), &snapshot->jitter_drop_pct, "%");
   snprintf(state->formatted_lines[6], sizeof(state->formatted_lines[6]), "Frames dropped due to network jitter: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->network_latency_avg_ms, " ms");
@@ -230,18 +264,24 @@ void stats_overlay_runtime_stop(void) {
 
 /** Records incoming frame timing information from the assembled decode unit. */
 void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit) {
-  uint64_t now_us = LiGetMicroseconds();
   // Moonlight reports host latency in tenths of a millisecond, so divide by 10 to display real milliseconds.
   double host_latency_ms = decode_unit->frameHostProcessingLatency / 10.0;
 
   pthread_mutex_lock(&stats_overlay_runtime_mutex);
 
   stats_overlay_runtime_window.incoming_frames++;
+  stats_overlay_window_push_enqueue_time(&stats_overlay_runtime_window, decode_unit->enqueueTimeUs);
 
-  if (decode_unit->enqueueTimeUs != 0 && now_us >= decode_unit->enqueueTimeUs) {
-    // Convert the microsecond queue timestamp delta into milliseconds for the overlay contract.
-    stats_overlay_runtime_window.queue_delay_total_ms += (now_us - decode_unit->enqueueTimeUs) / 1000.0;
-    stats_overlay_runtime_window.queue_delay_count++;
+  if (decode_unit->presentationTimeUs != 0) {
+    if (stats_overlay_runtime_window.last_presentation_time_us != 0 &&
+        decode_unit->presentationTimeUs > stats_overlay_runtime_window.last_presentation_time_us) {
+      // Presentation timestamps are in microseconds, so their delta gives the live stream frame interval.
+      stats_overlay_runtime_window.stream_frame_interval_total_us +=
+          (double)(decode_unit->presentationTimeUs - stats_overlay_runtime_window.last_presentation_time_us);
+      stats_overlay_runtime_window.stream_frame_interval_count++;
+    }
+
+    stats_overlay_runtime_window.last_presentation_time_us = decode_unit->presentationTimeUs;
   }
 
   if (decode_unit->frameHostProcessingLatency != 0) {
@@ -268,12 +308,20 @@ void stats_overlay_runtime_note_decoded_frame(double decode_time_ms) {
   pthread_mutex_unlock(&stats_overlay_runtime_mutex);
 }
 
-/** Records a presented frame and its measured render cost. */
-void stats_overlay_runtime_note_render(double render_time_ms) {
+/** Records a presented frame, its measured render cost, and its end-to-end queue delay. */
+void stats_overlay_runtime_note_render(double render_time_ms, uint64_t render_completed_us) {
+  uint64_t enqueue_time_us;
+
   pthread_mutex_lock(&stats_overlay_runtime_mutex);
 
   stats_overlay_runtime_window.rendered_frames++;
   stats_overlay_runtime_window.render_time_total_ms += render_time_ms;
+  if (stats_overlay_window_pop_enqueue_time(&stats_overlay_runtime_window, &enqueue_time_us) &&
+      render_completed_us >= enqueue_time_us) {
+    // Convert enqueue-to-present time from microseconds to milliseconds to match Moonlight-qt style reporting.
+    stats_overlay_runtime_window.queue_delay_total_ms += (render_completed_us - enqueue_time_us) / 1000.0;
+    stats_overlay_runtime_window.queue_delay_count++;
+  }
 
   pthread_mutex_unlock(&stats_overlay_runtime_mutex);
 }
@@ -308,6 +356,13 @@ bool stats_overlay_runtime_refresh(void) {
           stats_overlay_runtime_window.decoded_frames / elapsed_seconds);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.rendering_fps, true,
           stats_overlay_runtime_window.rendered_frames / elapsed_seconds);
+    }
+
+    if (stats_overlay_runtime_window.stream_frame_interval_count != 0) {
+      // Average frame interval is in microseconds, so divide 1,000,000 by the interval to get dynamic stream FPS.
+      stats_overlay_runtime_snapshot.video_fps =
+          1000000.0 / (stats_overlay_runtime_window.stream_frame_interval_total_us /
+              stats_overlay_runtime_window.stream_frame_interval_count);
     }
 
     // Populate averages only when samples exist so the overlay can still render Unavailable placeholders.

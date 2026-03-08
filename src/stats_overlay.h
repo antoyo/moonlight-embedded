@@ -90,7 +90,7 @@ void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const
 void stats_overlay_runtime_stop(void);
 void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit);
 void stats_overlay_runtime_note_decoded_frame(double decode_time_ms);
-void stats_overlay_runtime_note_render(double render_time_ms);
+void stats_overlay_runtime_note_render(double render_time_ms, uint64_t render_completed_us);
 bool stats_overlay_runtime_refresh(void);
 const STATS_OVERLAY_STATE* stats_overlay_runtime_state(void);
 bool stats_overlay_runtime_is_visible(void);

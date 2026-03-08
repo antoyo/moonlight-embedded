@@ -58,6 +58,7 @@ static int display_height;
 static int frame_handle(int pipefd) {
   AVFrame* frame = NULL;
   uint64_t render_started_us;
+  uint64_t render_completed_us;
   while (read(pipefd, &frame, sizeof(void*)) > 0);
   if (frame) {
     render_started_us = LiGetMicroseconds();
@@ -67,8 +68,9 @@ static int frame_handle(int pipefd) {
     else if (ffmpeg_decoder == VAAPI)
       vaapi_queue(frame, window, display_width, display_height);
     #endif
+    render_completed_us = LiGetMicroseconds();
     // LiGetMicroseconds() returns microseconds, so divide by 1000 to report render cost in milliseconds.
-    stats_overlay_runtime_note_render((LiGetMicroseconds() - render_started_us) / 1000.0);
+    stats_overlay_runtime_note_render((render_completed_us - render_started_us) / 1000.0, render_completed_us);
   }
 
   return LOOP_OK;

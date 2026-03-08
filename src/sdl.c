@@ -105,13 +105,15 @@ void sdl_loop() {
             Uint8** data = ((Uint8**) event.user.data1);
             int* linesize = ((int*) event.user.data2);
             uint64_t render_started_us = LiGetMicroseconds();
+            uint64_t render_completed_us;
             SDL_UpdateYUVTexture(bmp, NULL, data[0], linesize[0], data[1], linesize[1], data[2], linesize[2]);
             SDL_UnlockMutex(mutex);
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, bmp, NULL, NULL);
             SDL_RenderPresent(renderer);
+            render_completed_us = LiGetMicroseconds();
             // LiGetMicroseconds() returns microseconds, so divide by 1000 to report render cost in milliseconds.
-            stats_overlay_runtime_note_render((LiGetMicroseconds() - render_started_us) / 1000.0);
+            stats_overlay_runtime_note_render((render_completed_us - render_started_us) / 1000.0, render_completed_us);
           } else
             fprintf(stderr, "Couldn't lock mutex\n");
         }
