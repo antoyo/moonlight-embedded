@@ -85,6 +85,8 @@ size_t stats_overlay_measure_width(const STATS_OVERLAY_STATE* state);
 size_t stats_overlay_measure_height(const STATS_OVERLAY_STATE* state);
 void stats_overlay_clear_box(uint32_t* pixels, size_t stride_pixels, size_t width, size_t height, uint32_t color);
 void stats_overlay_draw_yuv420(uint8_t* const planes[3], const int linesize[3], int width, int height, const STATS_OVERLAY_STATE* state);
+void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width, int height, const STATS_OVERLAY_STATE* state,
+    uint32_t fg_color, uint32_t bg_color);
 
 void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const PSTATS_OVERLAY_CAPABILITY capability, int width, int height, double fps, const char* codec);
 void stats_overlay_runtime_stop(void);

@@ -32,9 +32,12 @@
 #include <codec.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/mman.h>
 
 #include <linux/videodev2.h>
+#include <linux/fb.h>
 
+#include "../stats_overlay.h"
 #include "../util.h"
 #include "video.h"
 
@@ -47,12 +50,139 @@ static codec_para_t codecParam = { 0 };
 static pthread_t displayThread;
 static int videoFd = -1;
 static volatile bool done = false;
+static int overlayFd = -1;
+static uint32_t* overlayPixels = NULL;
+static size_t overlayMapSize = 0;
+static size_t overlayStridePixels = 0;
+static int overlayWidth = 0;
+static int overlayHeight = 0;
+static bool overlayEnabled = false;
+static bool overlayReady = false;
+static bool overlayWarningEmitted = false;
+static uint32_t overlayFgColor = 0;
+static uint32_t overlayBgColor = 0;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
+/** Packs RGBA bytes into the active AML framebuffer channel layout. */
+static uint32_t aml_pack_fb_color(const struct fb_var_screeninfo* var, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  uint32_t color = 0;
+  uint32_t max_value;
+
+  if (var->red.length != 0) {
+    max_value = (1U << var->red.length) - 1U;
+    color |= (((uint32_t) r * max_value) / 255U) << var->red.offset;
+  }
+  if (var->green.length != 0) {
+    max_value = (1U << var->green.length) - 1U;
+    color |= (((uint32_t) g * max_value) / 255U) << var->green.offset;
+  }
+  if (var->blue.length != 0) {
+    max_value = (1U << var->blue.length) - 1U;
+    color |= (((uint32_t) b * max_value) / 255U) << var->blue.offset;
+  }
+  if (var->transp.length != 0) {
+    max_value = (1U << var->transp.length) - 1U;
+    color |= (((uint32_t) a * max_value) / 255U) << var->transp.offset;
+  }
+
+  return color;
+}
+
+/** Emits a single warning when AML overlay composition cannot be initialized. */
+static void aml_warn_overlay(const char* reason) {
+  if (overlayWarningEmitted)
+    return;
+
+  fprintf(stderr, "Stats overlay unavailable on AML: %s\n", reason);
+  overlayWarningEmitted = true;
+}
+
+/** Clears the mapped AML overlay framebuffer. */
+static void aml_clear_overlay(void) {
+  if (overlayPixels != NULL)
+    memset(overlayPixels, 0, overlayMapSize);
+}
+
+/** Opens and maps an AML OSD framebuffer for stats overlay composition. */
+static bool aml_overlay_init(void) {
+  static const char* devices[] = { "/dev/fb1", "/dev/fb0" };
+  static const char* blank_paths[] = { "/sys/class/graphics/fb1/blank", "/sys/class/graphics/fb0/blank" };
+  size_t i;
+
+  for (i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+    struct fb_fix_screeninfo fix = { 0 };
+    struct fb_var_screeninfo var = { 0 };
+    int fd = open(devices[i], O_RDWR);
+
+    if (fd < 0)
+      continue;
+    if (ioctl(fd, FBIOGET_FSCREENINFO, &fix) < 0 || ioctl(fd, FBIOGET_VSCREENINFO, &var) < 0) {
+      close(fd);
+      continue;
+    }
+    if (var.bits_per_pixel != 32 || fix.line_length == 0 || var.xres == 0 || var.yres == 0) {
+      close(fd);
+      continue;
+    }
+
+    overlayMapSize = fix.smem_len != 0 ? fix.smem_len : (size_t) fix.line_length * var.yres_virtual;
+    overlayPixels = mmap(NULL, overlayMapSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (overlayPixels == MAP_FAILED) {
+      overlayPixels = NULL;
+      close(fd);
+      continue;
+    }
+
+    overlayFd = fd;
+    overlayStridePixels = fix.line_length / sizeof(uint32_t);
+    overlayWidth = var.xres;
+    overlayHeight = var.yres;
+    overlayFgColor = aml_pack_fb_color(&var, 255, 255, 255, 255);
+    overlayBgColor = aml_pack_fb_color(&var, 0, 0, 0, var.transp.length != 0 ? 160 : 255);
+
+    // Unblank the OSD framebuffer selected for overlay composition.
+    write_bool((char*) blank_paths[i], false);
+    aml_clear_overlay();
+    return true;
+  }
+
+  return false;
+}
+
+/** Tears down the mapped AML overlay framebuffer. */
+static void aml_overlay_destroy(void) {
+  if (overlayPixels != NULL) {
+    aml_clear_overlay();
+    munmap(overlayPixels, overlayMapSize);
+    overlayPixels = NULL;
+  }
+  if (overlayFd >= 0) {
+    close(overlayFd);
+    overlayFd = -1;
+  }
+  overlayMapSize = 0;
+  overlayStridePixels = 0;
+  overlayWidth = 0;
+  overlayHeight = 0;
+}
+
+/** Draws the current stats overlay into the AML OSD framebuffer. */
+static void aml_overlay_render(void) {
+  if (!overlayEnabled || !overlayReady || overlayPixels == NULL)
+    return;
+
+  if (stats_overlay_runtime_refresh())
+    stats_overlay_draw_argb32(overlayPixels, overlayStridePixels, overlayWidth, overlayHeight,
+        stats_overlay_runtime_state(), overlayFgColor, overlayBgColor);
+}
+
+/** Drains AML display buffers and refreshes the OSD overlay once per presented frame. */
 void* aml_display_thread(void* unused) {
   while (!done) {
     struct v4l2_buffer vbuf = { 0 };
+    uint64_t render_started_us;
+    uint64_t render_completed_us;
     vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     if (ioctl(videoFd, VIDIOC_DQBUF, &vbuf) < 0) {
@@ -64,16 +194,25 @@ void* aml_display_thread(void* unused) {
       break;
     }
 
+    render_started_us = LiGetMicroseconds();
     if (ioctl(videoFd, VIDIOC_QBUF, &vbuf) < 0) {
       fprintf(stderr, "VIDIOC_QBUF failed: %d\n", errno);
       break;
     }
+
+    aml_overlay_render();
+    render_completed_us = LiGetMicroseconds();
+    // LiGetMicroseconds() returns microseconds, so divide by 1000 to store AML present cost in milliseconds.
+    stats_overlay_runtime_note_render((render_completed_us - render_started_us) / 1000.0, render_completed_us);
   }
   printf("Display thread terminated\n");
   return NULL;
 }
 
+/** Initializes the AML codec path and optional OSD overlay plane. */
 int aml_setup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
+  PSTATS_OVERLAY_PREFERENCE stats_pref = context;
+  const char* codec = "H264";
 
   codecParam.handle             = -1;
   codecParam.cntl_handle        = -1;
@@ -83,6 +222,10 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.noblock            = 0;
   codecParam.stream_type        = STREAM_TYPE_ES_VIDEO;
   codecParam.am_sysinfo.param   = 0;
+  done = false;
+  overlayWarningEmitted = false;
+  overlayEnabled = stats_pref != NULL && stats_pref->enabled;
+  overlayReady = false;
 
 #ifdef STREAM_TYPE_FRAME
   codecParam.dec_mode           = STREAM_TYPE_FRAME;
@@ -109,10 +252,12 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
           codecParam.am_sysinfo.param = (void*) UCODE_IP_ONLY_PARAM;
     }
   } else if (videoFormat & VIDEO_FORMAT_MASK_H265) {
+    codec = "HEVC";
     codecParam.video_type = VFORMAT_HEVC;
     codecParam.am_sysinfo.format = VIDEO_DEC_FORMAT_HEVC;
 #ifdef CODEC_TAG_AV1
   } else if (videoFormat & VIDEO_FORMAT_MASK_AV1) {
+    codec = "AV1";
     codecParam.video_type = VFORMAT_AV1;
     codecParam.am_sysinfo.format = VIDEO_DEC_FORMAT_AV1;
 #endif
@@ -125,6 +270,18 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.am_sysinfo.height = height;
   codecParam.am_sysinfo.rate = 96000 / redrawRate;
   codecParam.am_sysinfo.param = (void*) ((size_t) codecParam.am_sysinfo.param | SYNC_OUTSIDE);
+
+  if (overlayEnabled) {
+    STATS_OVERLAY_CAPABILITY capability;
+
+    stats_overlay_capability_init(&capability, true, true, NULL);
+    stats_overlay_runtime_configure(stats_pref, &capability, width, height, redrawRate, codec);
+    overlayReady = aml_overlay_init();
+    if (!overlayReady) {
+      aml_warn_overlay("no 32-bit OSD framebuffer could be mapped");
+      stats_overlay_runtime_stop();
+    }
+  }
 
   int ret;
   if ((ret = codec_init(&codecParam)) != 0) {
@@ -162,6 +319,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   return 0;
 }
 
+/** Releases AML decode resources and any mapped overlay framebuffer. */
 void aml_cleanup() {
   if (videoFd >= 0) {
     done = true;
@@ -171,11 +329,17 @@ void aml_cleanup() {
 
   codec_close(&codecParam);
   free(pkt_buf);
+  aml_overlay_destroy();
+  stats_overlay_runtime_stop();
 }
 
+/** Submits a decode unit to AML and records the live overlay timing samples. */
 int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
+  uint64_t decode_started_us;
 
   ensure_buf_size(&pkt_buf, &pkt_buf_size, decodeUnit->fullLength);
+  if (overlayEnabled)
+    stats_overlay_runtime_note_decode_unit(decodeUnit);
 
   int written = 0, length = 0, errCounter = 0, api;
   PLENTRY entry = decodeUnit->bufferList;
@@ -185,7 +349,9 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
     entry = entry->next;
   } while (entry != NULL);
 
-  codec_checkin_pts(&codecParam, decodeUnit->presentationTimeMs);
+  // AML amcodec expects PTS in milliseconds, so convert the Moonlight microsecond timestamp by dividing by 1000.
+  codec_checkin_pts(&codecParam, decodeUnit->presentationTimeUs / 1000);
+  decode_started_us = LiGetMicroseconds();
   while (length > 0) {
     api = codec_write(&codecParam, pkt_buf+written, length);
     if (api < 0) {
@@ -204,6 +370,11 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
       written += api;
       length -= api;
     }
+  }
+
+  if (overlayEnabled) {
+    // LiGetMicroseconds() returns microseconds, so divide by 1000 to store AML submit cost in milliseconds.
+    stats_overlay_runtime_note_decoded_frame((LiGetMicroseconds() - decode_started_us) / 1000.0);
   }
 
   return length ? DR_NEED_IDR : DR_OK;

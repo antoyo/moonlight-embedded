@@ -157,3 +157,76 @@ void stats_overlay_draw_yuv420(uint8_t* const planes[3], const int linesize[3], 
     }
   }
 }
+
+/** Draws the formatted overlay text into a 32-bit framebuffer-backed ARGB plane. */
+void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width, int height, const STATS_OVERLAY_STATE* state,
+    uint32_t fg_color, uint32_t bg_color) {
+  int margin = 8 * STATS_OVERLAY_FONT_SCALE;
+  int line;
+  int text_width = (int)stats_overlay_measure_width(state);
+  int text_height = (int)stats_overlay_measure_height(state);
+
+  if (state->line_count == 0 || pixels == NULL || stride_pixels == 0)
+    return;
+
+  stats_overlay_clear_box(pixels, stride_pixels, width, height, 0);
+  {
+    int box_x = margin - (4 * STATS_OVERLAY_FONT_SCALE);
+    int box_y = margin - (4 * STATS_OVERLAY_FONT_SCALE);
+    int box_w = text_width + (8 * STATS_OVERLAY_FONT_SCALE);
+    int box_h = text_height + (8 * STATS_OVERLAY_FONT_SCALE);
+    int y;
+
+    for (y = 0; y < box_h; y++) {
+      int draw_y = box_y + y;
+      int x;
+
+      if (draw_y < 0 || draw_y >= height)
+        continue;
+
+      for (x = 0; x < box_w; x++) {
+        int draw_x = box_x + x;
+
+        if (draw_x < 0 || draw_x >= width)
+          continue;
+
+        pixels[(draw_y * stride_pixels) + draw_x] = bg_color;
+      }
+    }
+  }
+
+  for (line = 0; line < (int) state->line_count; line++) {
+    int x = margin;
+    int y = margin + (line * STATS_OVERLAY_FONT_HEIGHT);
+    const char* cursor = state->formatted_lines[line];
+
+    while (*cursor != '\0') {
+      unsigned int row;
+      unsigned int col;
+
+      for (row = 0; row < 7; row++) {
+        uint8_t bits = stats_overlay_glyph_row(*cursor, row);
+        for (col = 0; col < 5; col++) {
+          size_t py;
+          size_t px;
+
+          if ((bits & (1U << (4 - col))) == 0)
+            continue;
+
+          for (py = 0; py < STATS_OVERLAY_FONT_SCALE; py++) {
+            for (px = 0; px < STATS_OVERLAY_FONT_SCALE; px++) {
+              int draw_x = x + ((int) col * STATS_OVERLAY_FONT_SCALE) + (int) px;
+              int draw_y = y + ((int) row * STATS_OVERLAY_FONT_SCALE) + (int) py;
+
+              if (draw_x >= 0 && draw_x < width && draw_y >= 0 && draw_y < height)
+                pixels[(draw_y * stride_pixels) + draw_x] = fg_color;
+            }
+          }
+        }
+      }
+
+      x += STATS_OVERLAY_FONT_WIDTH;
+      cursor++;
+    }
+  }
+}
