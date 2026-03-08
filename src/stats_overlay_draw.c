@@ -169,15 +169,12 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
     uint32_t fg_color, uint32_t bg_color) {
   int margin = 8 * STATS_OVERLAY_FONT_SCALE;
   int line;
-  int text_width = (int)stats_overlay_measure_width(state);
-  int text_height = (int)stats_overlay_measure_height(state);
   int clear_width = (STATS_OVERLAY_MAX_LINE_LENGTH * STATS_OVERLAY_FONT_WIDTH) + (8 * STATS_OVERLAY_FONT_SCALE);
   int clear_height = (STATS_OVERLAY_MAX_LINES * STATS_OVERLAY_FONT_HEIGHT) + (8 * STATS_OVERLAY_FONT_SCALE);
 
   if (state->line_count == 0 || pixels == NULL || stride_pixels == 0)
     return;
 
-  stats_overlay_clear_box(pixels, stride_pixels, width, height, 0);
   {
     int box_x = margin - (4 * STATS_OVERLAY_FONT_SCALE);
     int box_y = margin - (4 * STATS_OVERLAY_FONT_SCALE);
@@ -185,31 +182,7 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
     int box_h = clear_height;
     int y;
 
-    for (y = 0; y < box_h; y++) {
-      int draw_y = box_y + y;
-      int x;
-
-      if (draw_y < 0 || draw_y >= height)
-        continue;
-
-      for (x = 0; x < box_w; x++) {
-        int draw_x = box_x + x;
-
-        if (draw_x < 0 || draw_x >= width)
-          continue;
-
-        pixels[(draw_y * stride_pixels) + draw_x] = bg_color;
-      }
-    }
-  }
-
-  {
-    int box_x = margin - (4 * STATS_OVERLAY_FONT_SCALE);
-    int box_y = margin - (4 * STATS_OVERLAY_FONT_SCALE);
-    int box_w = text_width + (8 * STATS_OVERLAY_FONT_SCALE);
-    int box_h = text_height + (8 * STATS_OVERLAY_FONT_SCALE);
-    int y;
-
+    // Clear only the reserved overlay region so AML OSD updates do not blink the entire plane on each refresh.
     for (y = 0; y < box_h; y++) {
       int draw_y = box_y + y;
       int x;
