@@ -173,7 +173,10 @@ static void aml_overlay_render(void) {
   if (!overlayEnabled || !overlayReady || overlayPixels == NULL)
     return;
 
-  if (stats_overlay_runtime_refresh())
+  // Refresh the formatted stats text on its normal cadence, but repaint the cached overlay every frame so
+  // AML video-plane updates cannot leave the OSD temporarily blank between metric refreshes.
+  stats_overlay_runtime_refresh();
+  if (stats_overlay_runtime_is_visible())
     stats_overlay_draw_argb32(overlayPixels, overlayStridePixels, overlayWidth, overlayHeight,
         stats_overlay_runtime_state(), overlayFgColor, overlayBgColor);
 }
