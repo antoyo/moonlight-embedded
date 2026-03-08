@@ -226,6 +226,7 @@ void* aml_display_thread(void* unused) {
     struct v4l2_buffer vbuf = { 0 };
     uint64_t frame_completed_us;
     uint64_t render_completed_us;
+    int video_delay_ms = 0;
     vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     if (ioctl(videoFd, VIDIOC_DQBUF, &vbuf) < 0) {
@@ -239,8 +240,15 @@ void* aml_display_thread(void* unused) {
 
     // A dequeued AML capture buffer corresponds to a frame that has completed the hardware decode/display pipeline.
     frame_completed_us = LiGetMicroseconds();
-    if (overlayEnabled)
-      stats_overlay_runtime_note_decoded_output();
+    if (overlayEnabled) {
+      if (codec_get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0 && video_delay_ms >= 0) {
+        // amcodec does not expose a true per-frame hardware decode duration, so use its current video delay
+        // as the best decoder-side latency estimate available from the AML stack for this completed frame.
+        stats_overlay_runtime_note_decoded_frame((double) video_delay_ms);
+      } else {
+        stats_overlay_runtime_note_decoded_output();
+      }
+    }
 
     if (ioctl(videoFd, VIDIOC_QBUF, &vbuf) < 0) {
       fprintf(stderr, "VIDIOC_QBUF failed: %d\n", errno);
