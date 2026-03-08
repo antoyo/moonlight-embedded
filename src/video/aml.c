@@ -224,7 +224,7 @@ static void aml_overlay_render(void) {
 void* aml_display_thread(void* unused) {
   while (!done) {
     struct v4l2_buffer vbuf = { 0 };
-    uint64_t render_started_us;
+    uint64_t frame_completed_us;
     uint64_t render_completed_us;
     vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
@@ -237,7 +237,11 @@ void* aml_display_thread(void* unused) {
       break;
     }
 
-    render_started_us = LiGetMicroseconds();
+    // A dequeued AML capture buffer corresponds to a frame that has completed the hardware decode/display pipeline.
+    frame_completed_us = LiGetMicroseconds();
+    if (overlayEnabled)
+      stats_overlay_runtime_note_decoded_output();
+
     if (ioctl(videoFd, VIDIOC_QBUF, &vbuf) < 0) {
       fprintf(stderr, "VIDIOC_QBUF failed: %d\n", errno);
       break;
@@ -245,8 +249,9 @@ void* aml_display_thread(void* unused) {
 
     aml_overlay_render();
     render_completed_us = LiGetMicroseconds();
-    // LiGetMicroseconds() returns microseconds, so divide by 1000 to store AML present cost in milliseconds.
-    stats_overlay_runtime_note_render((render_completed_us - render_started_us) / 1000.0, render_completed_us);
+    // Use the dequeue timestamp as the frame completion point so queue delay includes AML decode buffering.
+    // The small delta to render_completed_us only measures overlay/compositor bookkeeping after the frame finished.
+    stats_overlay_runtime_note_render((render_completed_us - frame_completed_us) / 1000.0, frame_completed_us);
   }
   printf("Display thread terminated\n");
   return NULL;
@@ -378,8 +383,6 @@ void aml_cleanup() {
 
 /** Submits a decode unit to AML and records the live overlay timing samples. */
 int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
-  uint64_t decode_started_us;
-
   ensure_buf_size(&pkt_buf, &pkt_buf_size, decodeUnit->fullLength);
   if (overlayEnabled)
     stats_overlay_runtime_note_decode_unit(decodeUnit);
@@ -395,7 +398,6 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   // AML amcodec expects PTS in milliseconds, so convert the Moonlight microsecond timestamp by dividing by 1000.
   // presentationTimeUs is in microseconds; amcodec expects milliseconds.
   codec_checkin_pts(&codecParam, decodeUnit->presentationTimeUs / 1000);
-  decode_started_us = LiGetMicroseconds();
   while (length > 0) {
     api = codec_write(&codecParam, pkt_buf+written, length);
     if (api < 0) {
@@ -414,11 +416,6 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
       written += api;
       length -= api;
     }
-  }
-
-  if (overlayEnabled) {
-    // LiGetMicroseconds() returns microseconds, so divide by 1000 to store AML submit cost in milliseconds.
-    stats_overlay_runtime_note_decoded_frame((LiGetMicroseconds() - decode_started_us) / 1000.0);
   }
 
   return length ? DR_NEED_IDR : DR_OK;

@@ -91,6 +91,7 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
 void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const PSTATS_OVERLAY_CAPABILITY capability, int width, int height, double fps, const char* codec);
 void stats_overlay_runtime_stop(void);
 void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit);
+void stats_overlay_runtime_note_decoded_output(void);
 void stats_overlay_runtime_note_decoded_frame(double decode_time_ms);
 void stats_overlay_runtime_note_render(double render_time_ms, uint64_t render_completed_us);
 bool stats_overlay_runtime_refresh(void);

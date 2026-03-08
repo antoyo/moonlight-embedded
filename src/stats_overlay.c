@@ -14,6 +14,7 @@ typedef struct _STATS_OVERLAY_WINDOW {
   double stream_frame_interval_total_us;
   unsigned int stream_frame_interval_count;
   double decode_time_total_ms;
+  unsigned int decode_time_count;
   double render_time_total_ms;
   double queue_delay_total_ms;
   unsigned int queue_delay_count;
@@ -304,6 +305,16 @@ void stats_overlay_runtime_note_decoded_frame(double decode_time_ms) {
 
   stats_overlay_runtime_window.decoded_frames++;
   stats_overlay_runtime_window.decode_time_total_ms += decode_time_ms;
+  stats_overlay_runtime_window.decode_time_count++;
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Records a decoder output frame when the backend cannot measure decode cost separately. */
+void stats_overlay_runtime_note_decoded_output(void) {
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  stats_overlay_runtime_window.decoded_frames++;
 
   pthread_mutex_unlock(&stats_overlay_runtime_mutex);
 }
@@ -363,10 +374,10 @@ bool stats_overlay_runtime_refresh(void) {
 
     // Populate averages only when samples exist so the overlay can still render Unavailable placeholders.
     stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.decode_time_avg_ms,
-        stats_overlay_runtime_window.decoded_frames != 0,
+        stats_overlay_runtime_window.decode_time_count != 0,
         // Divide the total measured decode time by the number of decoded frames to get an average per frame.
-        stats_overlay_runtime_window.decoded_frames != 0 ?
-            stats_overlay_runtime_window.decode_time_total_ms / stats_overlay_runtime_window.decoded_frames : 0.0);
+        stats_overlay_runtime_window.decode_time_count != 0 ?
+            stats_overlay_runtime_window.decode_time_total_ms / stats_overlay_runtime_window.decode_time_count : 0.0);
     stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.render_time_avg_ms,
         stats_overlay_runtime_window.rendered_frames != 0,
         // Divide the total present cost by rendered frames to keep the metric stable across refresh windows.
