@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -79,6 +80,9 @@ static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
 static bool amlDebugEnabled = false;
 static uint64_t amlLastResyncRequestUs = 0;
 static bool amlAwaitingIdr = false;
+static int amlConfiguredRateX100 = 0;
+static unsigned int amlConfiguredFrameDurationTicks = 0;
+static int amlFracRatePolicy = -1;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -216,12 +220,14 @@ static bool aml_read_display_mode(char* buffer, size_t buffer_size) {
 
   for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
     char raw_mode[64];
+    int raw_length;
     size_t len;
 
-    if (read_file((char*) paths[i], raw_mode, sizeof(raw_mode) - 1) <= 0)
+    raw_length = read_file((char*) paths[i], raw_mode, sizeof(raw_mode) - 1);
+    if (raw_length <= 0)
       continue;
 
-    raw_mode[sizeof(raw_mode) - 1] = '\0';
+    raw_mode[raw_length] = '\0';
     len = strcspn(raw_mode, "\r\n");
     raw_mode[len] = '\0';
     if (raw_mode[0] == '\0')
@@ -232,6 +238,128 @@ static bool aml_read_display_mode(char* buffer, size_t buffer_size) {
   }
 
   return false;
+}
+
+/** Parses the trailing refresh-rate token from an AML mode string into Hz x100. */
+static bool aml_parse_refresh_rate_x100(const char* display_mode, int* refresh_rate_x100) {
+  const char* hz;
+  const char* rate_start;
+  char* end;
+  double parsed_rate;
+  char rate_buffer[16];
+  size_t rate_length;
+
+  if (display_mode == NULL || refresh_rate_x100 == NULL)
+    return false;
+
+  hz = strstr(display_mode, "hz");
+  if (hz == NULL)
+    return false;
+
+  rate_start = hz;
+  while (rate_start > display_mode && (isdigit((unsigned char) rate_start[-1]) || rate_start[-1] == '.'))
+    rate_start--;
+  if (rate_start == hz)
+    return false;
+
+  // Copy the numeric suffix into a bounded buffer so strtod() can parse both integer and fractional rates.
+  rate_length = (size_t) (hz - rate_start);
+  if (rate_length >= sizeof(rate_buffer))
+    return false;
+
+  memcpy(rate_buffer, rate_start, rate_length);
+  rate_buffer[rate_length] = '\0';
+  parsed_rate = strtod(rate_buffer, &end);
+  if (end == rate_buffer || *end != '\0' || parsed_rate <= 0.0)
+    return false;
+
+  *refresh_rate_x100 = (int) (parsed_rate * 100.0 + 0.5);
+  return true;
+}
+
+/** Reads the AML fractional refresh-rate policy when the HDMI driver exposes it. */
+static bool aml_read_frac_rate_policy(int* frac_rate_policy) {
+  char buffer[16];
+  int length;
+  char* end;
+  long parsed_value;
+
+  if (frac_rate_policy == NULL)
+    return false;
+
+  length = read_file("/sys/class/amhdmitx/amhdmitx0/frac_rate_policy", buffer, sizeof(buffer) - 1);
+  if (length <= 0)
+    return false;
+
+  buffer[length] = '\0';
+  parsed_value = strtol(buffer, &end, 10);
+  if (end == buffer)
+    return false;
+
+  *frac_rate_policy = (int) parsed_value;
+  return true;
+}
+
+/** Returns the common fractional HDMI refresh rate x100 for a nominal integer mode. */
+static int aml_fractional_refresh_x100_for_nominal(int nominal_refresh_hz) {
+  switch (nominal_refresh_hz) {
+  case 24:
+    return 2398;
+  case 30:
+    return 2997;
+  case 60:
+    return 5994;
+  case 120:
+    return 11988;
+  default:
+    return 0;
+  }
+}
+
+/** Detects the AML stream cadence in Hz x100, honoring fractional HDMI policy only when it matches the stream FPS. */
+static int aml_detect_stream_rate_x100(int redrawRate) {
+  char display_mode[64];
+  int detected_rate_x100;
+  int frac_rate_policy;
+
+  if (redrawRate <= 0)
+    return 0;
+
+  detected_rate_x100 = redrawRate * 100;
+  amlFracRatePolicy = -1;
+  if (!aml_read_display_mode(display_mode, sizeof(display_mode)))
+    return detected_rate_x100;
+  if (!aml_parse_refresh_rate_x100(display_mode, &detected_rate_x100))
+    return redrawRate * 100;
+
+  // Only trust the display mode when it describes the same cadence as the requested stream FPS.
+  if ((detected_rate_x100 + 50) / 100 != redrawRate)
+    return redrawRate * 100;
+
+  if (aml_read_frac_rate_policy(&frac_rate_policy)) {
+    int fractional_rate_x100;
+
+    amlFracRatePolicy = frac_rate_policy;
+    if (frac_rate_policy != 0 && detected_rate_x100 == redrawRate * 100) {
+      // AML often reports 1080p60hz while the HDMI block actually runs at 59.94 Hz under fractional mode.
+      fractional_rate_x100 = aml_fractional_refresh_x100_for_nominal(redrawRate);
+      if (fractional_rate_x100 != 0)
+        detected_rate_x100 = fractional_rate_x100;
+    }
+  }
+
+  return detected_rate_x100;
+}
+
+/** Converts the detected AML stream cadence into the 96 kHz frame-duration ticks expected by amcodec. */
+static unsigned int aml_frame_duration_ticks(int redrawRate) {
+  int detected_rate_x100 = aml_detect_stream_rate_x100(redrawRate);
+
+  if (detected_rate_x100 <= 0)
+    return redrawRate > 0 ? 96000U / (unsigned int) redrawRate : 1600U;
+
+  amlConfiguredRateX100 = detected_rate_x100;
+  return (96000U * 100U + (unsigned int) (detected_rate_x100 / 2)) / (unsigned int) detected_rate_x100;
 }
 
 /** Discovers optional AML low-latency helper entry points from the linked amcodec library. */
@@ -395,13 +523,17 @@ static void aml_debug_log_setup_state(void) {
     return;
 
   printf("AML debug: target video delay %d ms, overlay %s, optional APIs delay_limit=%s cur_delay_ms=%s "
-         "cur_delay_frames=%s disable_slowsync=%s syncenable_off=%s, pts_checkin=on%s%s\n",
+         "cur_delay_frames=%s disable_slowsync=%s syncenable_off=%s, pts_checkin=on, source_rate=%d.%02d Hz "
+         "(frame_duration=%u, frac_policy=%s)%s%s\n",
       amlTargetDelayMs, overlayEnabled ? "on" : "off",
       amlOptionalApis.set_video_delay_limited_ms != NULL ? "yes" : "no",
       amlOptionalApis.get_video_cur_delay_ms != NULL ? "yes" : "no",
       amlOptionalApis.get_video_cur_delay_frames != NULL ? "yes" : "no",
       amlOptionalApis.disable_slowsync != NULL ? "yes" : "no",
       amlOptionalApis.set_syncenable != NULL ? "yes" : "no",
+      amlConfiguredRateX100 / 100, abs(amlConfiguredRateX100 % 100),
+      amlConfiguredFrameDurationTicks,
+      amlFracRatePolicy >= 0 ? (amlFracRatePolicy != 0 ? "on" : "off") : "unknown",
       amlDebugMetrics.display_mode[0] != '\0' ? ", display mode " : "",
       amlDebugMetrics.display_mode[0] != '\0' ? amlDebugMetrics.display_mode : "");
 }
@@ -786,6 +918,9 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
   amlLastResyncRequestUs = 0;
   amlAwaitingIdr = false;
+  amlConfiguredRateX100 = redrawRate * 100;
+  amlConfiguredFrameDurationTicks = 0;
+  amlFracRatePolicy = -1;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   aml_optional_apis_init();
   aml_reset_decode_submit_times();
@@ -834,7 +969,8 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
 
   codecParam.am_sysinfo.width = width;
   codecParam.am_sysinfo.height = height;
-  codecParam.am_sysinfo.rate = 96000 / redrawRate;
+  codecParam.am_sysinfo.rate = aml_frame_duration_ticks(redrawRate);
+  amlConfiguredFrameDurationTicks = codecParam.am_sysinfo.rate;
   codecParam.am_sysinfo.param = (void*) ((size_t) codecParam.am_sysinfo.param | SYNC_OUTSIDE);
 
   if (overlayEnabled) {
