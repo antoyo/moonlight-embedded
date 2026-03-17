@@ -26,6 +26,7 @@
 #include "audio/audio.h"
 #include "video/video.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,75 @@
 #include <dlfcn.h>
 
 typedef bool(*ImxInit)();
+
+/** Reads and trims a short AML display-mode string from sysfs when available. */
+static bool platform_read_aml_display_mode(char* buffer, size_t buffer_size) {
+  static const char* paths[] = {
+    "/sys/class/display/mode",
+    "/sys/class/amhdmitx/amhdmitx0/disp_mode",
+  };
+  size_t i;
+
+  for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    char raw_mode[64];
+    size_t len;
+
+    if (read_file((char*) paths[i], raw_mode, sizeof(raw_mode) - 1) <= 0)
+      continue;
+
+    raw_mode[sizeof(raw_mode) - 1] = '\0';
+    len = strcspn(raw_mode, "\r\n");
+    raw_mode[len] = '\0';
+    if (raw_mode[0] == '\0')
+      continue;
+
+    snprintf(buffer, buffer_size, "%s", raw_mode);
+    return true;
+  }
+
+  return false;
+}
+
+/** Maps common consumer-video refresh strings to the fractional rates hosts should pace against. */
+static int platform_parse_refresh_rate_x100(const char* mode) {
+  const char* hz;
+  const char* digits_end;
+  const char* digits_start;
+  int hz_value;
+
+  if (mode == NULL)
+    return 0;
+
+  hz = strstr(mode, "hz");
+  if (hz == NULL)
+    return 0;
+
+  digits_end = hz;
+  digits_start = digits_end;
+  while (digits_start > mode && isdigit((unsigned char) digits_start[-1]))
+    digits_start--;
+
+  if (digits_start == digits_end)
+    return 0;
+
+  hz_value = atoi(digits_start);
+  switch (hz_value) {
+  case 23:
+  case 24:
+    return 2397;
+  case 29:
+  case 30:
+    return 2997;
+  case 59:
+  case 60:
+    return 5994;
+  case 119:
+  case 120:
+    return 11988;
+  default:
+    return hz_value * 100;
+  }
+}
 
 /** Selects the first supported runtime backend that matches the requested name. */
 enum platform platform_check(char* name) {
@@ -290,5 +360,21 @@ void platform_get_overlay_capability(enum platform system, PSTATS_OVERLAY_CAPABI
   default:
     stats_overlay_capability_init(capability, false, false, "This backend does not support the stats overlay yet.");
     break;
+  }
+}
+
+/** Returns the client's measured display refresh rate x100 when the backend can detect it. */
+int platform_get_client_refresh_rate_x100(enum platform system) {
+  switch (system) {
+  case AML: {
+    char mode[64];
+
+    if (!platform_read_aml_display_mode(mode, sizeof(mode)))
+      return 0;
+
+    return platform_parse_refresh_rate_x100(mode);
+  }
+  default:
+    return 0;
   }
 }

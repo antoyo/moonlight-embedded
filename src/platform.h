@@ -37,6 +37,7 @@ PAUDIO_RENDERER_CALLBACKS platform_get_audio(enum platform system, char* audio_d
 bool platform_prefers_codec(enum platform system, enum codecs codec);
 char* platform_name(enum platform system);
 void platform_get_overlay_capability(enum platform system, PSTATS_OVERLAY_CAPABILITY capability);
+int platform_get_client_refresh_rate_x100(enum platform system);
 
 void platform_start(enum platform system);
 void platform_stop(enum platform system);

@@ -144,6 +144,10 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
     connection_debug = true;
   }
 
+  config->stream.clientRefreshRateX100 = platform_get_client_refresh_rate_x100(system);
+  if (config->debug_level > 0 && config->stream.clientRefreshRateX100 != 0)
+    printf("Client refresh rate x100: %d\n", config->stream.clientRefreshRateX100);
+
   // Lock the overlay preference once the session is about to start so later config edits do not affect it.
   platform_get_overlay_capability(system, &overlay_capability);
   stats_overlay_pref_lock(&config->stats_overlay);
