@@ -88,6 +88,7 @@ static int get_app_id(PSERVER_DATA server, const char *name) {
 /** Starts a streaming session with the selected backend and runtime options. */
 static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform system) {
   STATS_OVERLAY_CAPABILITY overlay_capability;
+  VIDEO_RENDERER_CONTEXT video_context;
   int appId = get_app_id(server, config->app);
   if (appId<0) {
     fprintf(stderr, "Can't find app %s\n", config->app);
@@ -148,6 +149,8 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   stats_overlay_pref_lock(&config->stats_overlay);
   stats_overlay_runtime_configure(&config->stats_overlay, &overlay_capability, config->stream.width, config->stream.height,
       config->stream.fps, config->codec == CODEC_HEVC ? "HEVC" : config->codec == CODEC_AV1 ? "AV1" : "H264");
+  video_context.stats_overlay = &config->stats_overlay;
+  video_context.debug_enabled = config->debug_level > 0;
   connection_reset_stats_overlay_warning();
   if (!overlay_capability.supports_overlay && config->stats_overlay.enabled)
     connection_warn_stats_overlay_unsupported(overlay_capability.unsupported_reason);
@@ -157,7 +160,7 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
 
   platform_start(system);
   LiStartConnection(&server->serverInfo, &config->stream, &connection_callbacks, platform_get_video(system),
-      platform_get_audio(system, config->audio_device), &config->stats_overlay, drFlags, config->audio_device, 0);
+      platform_get_audio(system, config->audio_device), &video_context, drFlags, config->audio_device, 0);
 
   if (IS_EMBEDDED(system)) {
     if (!config->viewonly)

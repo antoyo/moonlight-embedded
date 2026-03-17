@@ -39,7 +39,6 @@
 #include <linux/videodev2.h>
 #include <linux/fb.h>
 
-#include "../connection.h"
 #include "../stats_overlay.h"
 #include "../util.h"
 #include "video.h"
@@ -75,6 +74,7 @@ static bool overlayWarningEmitted = false;
 static uint32_t overlayFgColor = 0;
 static uint32_t overlayBgColor = 0;
 static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
+static bool amlDebugEnabled = false;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -133,7 +133,7 @@ static const unsigned int amlDebugMilestoneSeconds[AML_DEBUG_MILESTONE_COUNT] = 
 
 /** Returns true when the session is running with debug logging enabled. */
 static bool aml_debug_enabled(void) {
-  return connection_debug;
+  return amlDebugEnabled;
 }
 
 /** Returns the configured one-frame video-delay target for the active stream. */
@@ -710,7 +710,8 @@ void* aml_display_thread(void* unused) {
 
 /** Initializes the AML codec path and optional OSD overlay plane. */
 int aml_setup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
-  PSTATS_OVERLAY_PREFERENCE stats_pref = context;
+  PVIDEO_RENDERER_CONTEXT video_context = context;
+  PSTATS_OVERLAY_PREFERENCE stats_pref = video_context != NULL ? video_context->stats_overlay : NULL;
   const char* codec = "H264";
 
   codecParam.handle             = -1;
@@ -722,6 +723,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.stream_type        = STREAM_TYPE_ES_VIDEO;
   codecParam.am_sysinfo.param   = 0;
   done = false;
+  amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   aml_optional_apis_init();
   aml_reset_decode_submit_times();

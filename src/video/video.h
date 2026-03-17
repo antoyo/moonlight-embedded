@@ -21,6 +21,8 @@
 
 #include <stdbool.h>
 
+#include "../stats_overlay.h"
+
 #define DISPLAY_FULLSCREEN 1
 #define ENABLE_HARDWARE_ACCELERATION_1 2
 #define ENABLE_HARDWARE_ACCELERATION_2 4
@@ -34,6 +36,11 @@
 #define INIT_VAAPI 3
 
 #define INITIAL_DECODER_BUFFER_SIZE (256*1024)
+
+typedef struct _VIDEO_RENDERER_CONTEXT {
+  PSTATS_OVERLAY_PREFERENCE stats_overlay;
+  bool debug_enabled;
+} VIDEO_RENDERER_CONTEXT, *PVIDEO_RENDERER_CONTEXT;
 
 #ifdef HAVE_X11
 int x11_init(bool vdpau, bool vaapi);
