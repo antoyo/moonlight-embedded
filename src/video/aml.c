@@ -75,6 +75,7 @@ static bool overlayWarningEmitted = false;
 static uint32_t overlayFgColor = 0;
 static uint32_t overlayBgColor = 0;
 static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
+static void* amlOptionalApiHandle = NULL;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -230,10 +231,16 @@ static bool aml_read_display_mode(char* buffer, size_t buffer_size) {
 
 /** Discovers optional AML low-latency helper entry points from the linked amcodec library. */
 static void aml_optional_apis_init(void) {
-  amlOptionalApis.set_video_delay_limited_ms = (AmlCodecSetVideoDelayLimitedMs) dlsym(RTLD_DEFAULT, "codec_set_video_delay_limited_ms");
-  amlOptionalApis.get_video_cur_delay_ms = (AmlCodecGetVideoCurDelayMs) dlsym(RTLD_DEFAULT, "codec_get_video_cur_delay_ms");
-  amlOptionalApis.get_video_cur_delay_frames = (AmlCodecGetVideoCurDelayFrames) dlsym(RTLD_DEFAULT, "codec_get_video_cur_delay_frames");
-  amlOptionalApis.disable_slowsync = (AmlCodecDisableSlowsync) dlsym(RTLD_DEFAULT, "codec_disalbe_slowsync");
+  if (amlOptionalApiHandle == NULL)
+    amlOptionalApiHandle = dlopen(NULL, RTLD_LAZY);
+
+  if (amlOptionalApiHandle == NULL)
+    return;
+
+  amlOptionalApis.set_video_delay_limited_ms = (AmlCodecSetVideoDelayLimitedMs) dlsym(amlOptionalApiHandle, "codec_set_video_delay_limited_ms");
+  amlOptionalApis.get_video_cur_delay_ms = (AmlCodecGetVideoCurDelayMs) dlsym(amlOptionalApiHandle, "codec_get_video_cur_delay_ms");
+  amlOptionalApis.get_video_cur_delay_frames = (AmlCodecGetVideoCurDelayFrames) dlsym(amlOptionalApiHandle, "codec_get_video_cur_delay_frames");
+  amlOptionalApis.disable_slowsync = (AmlCodecDisableSlowsync) dlsym(amlOptionalApiHandle, "codec_disalbe_slowsync");
 }
 
 /** Applies optional AML low-latency controls when the runtime amcodec build exposes them. */
@@ -826,6 +833,10 @@ void aml_cleanup() {
 
   aml_debug_log_exit_summary();
   codec_close(&codecParam);
+  if (amlOptionalApiHandle != NULL) {
+    dlclose(amlOptionalApiHandle);
+    amlOptionalApiHandle = NULL;
+  }
   free(pkt_buf);
   pkt_buf = NULL;
   pkt_buf_size = 0;
