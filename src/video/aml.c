@@ -51,6 +51,8 @@
 #define AML_DEBUG_INTERVAL_US (1000ULL * 1000ULL)
 #define AML_DEFAULT_DELAY_LIMIT_MS 16
 #define AML_DEBUG_MILESTONE_COUNT 3
+#define AML_MAX_PENDING_FRAMES 6
+#define AML_RESYNC_COOLDOWN_US (1000ULL * 1000ULL)
 
 static codec_para_t codecParam = { 0 };
 static pthread_t displayThread;
@@ -75,6 +77,7 @@ static uint32_t overlayFgColor = 0;
 static uint32_t overlayBgColor = 0;
 static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
 static bool amlDebugEnabled = false;
+static uint64_t amlLastResyncRequestUs = 0;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -504,6 +507,34 @@ static bool aml_pop_decode_submit_time(uint64_t* submit_time_us) {
   return have_sample;
 }
 
+/** Returns the current number of AML frames queued between submit and display completion. */
+static unsigned int aml_pending_submit_depth(void) {
+  unsigned int pending_depth;
+
+  pthread_mutex_lock(&pendingDecodeSubmitMutex);
+
+  pending_depth = pendingDecodeSubmitCount;
+
+  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+  return pending_depth;
+}
+
+/** Returns true when the AML pipeline backlog is high enough that low-latency recovery should kick in. */
+static bool aml_should_request_resync(unsigned int pending_depth) {
+  uint64_t now_us;
+
+  if (pending_depth < AML_MAX_PENDING_FRAMES)
+    return false;
+
+  now_us = LiGetMicroseconds();
+  if (amlLastResyncRequestUs != 0 && now_us < amlLastResyncRequestUs + AML_RESYNC_COOLDOWN_US)
+    return false;
+
+  // Throttle reset/IDR requests so a single burst of late frames cannot trap the session in a reset loop.
+  amlLastResyncRequestUs = now_us;
+  return true;
+}
+
 /** Returns the number of vertically stacked framebuffer pages exposed by the AML OSD plane. */
 static size_t aml_overlay_page_count(const struct fb_var_screeninfo* var) {
   if (var->yres == 0 || var->yres_virtual <= var->yres)
@@ -724,6 +755,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.am_sysinfo.param   = 0;
   done = false;
   amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
+  amlLastResyncRequestUs = 0;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   aml_optional_apis_init();
   aml_reset_decode_submit_times();
@@ -845,6 +877,7 @@ void aml_cleanup() {
 
 /** Submits a decode unit to AML and records the live overlay timing samples. */
 int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
+  unsigned int pending_depth;
   uint64_t write_started_us;
   uint64_t submit_started_us;
   uint64_t write_completed_us;
@@ -854,6 +887,21 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   ensure_buf_size(&pkt_buf, &pkt_buf_size, decodeUnit->fullLength);
   if (overlayEnabled)
     stats_overlay_runtime_note_decode_unit(decodeUnit);
+
+  pending_depth = aml_pending_submit_depth();
+  if (aml_should_request_resync(pending_depth)) {
+    if (aml_debug_enabled()) {
+      // Reset before the queue runs away indefinitely; a brief resync is preferable to hundreds of milliseconds of added latency.
+      printf("AML debug: pending frame backlog reached %u, resetting decoder pipeline%s\n",
+          pending_depth, decodeUnit->frameType == FRAME_TYPE_IDR ? " and keeping current IDR" : " and requesting IDR");
+    }
+
+    codec_reset(&codecParam);
+    aml_reset_decode_submit_times();
+
+    if (decodeUnit->frameType != FRAME_TYPE_IDR)
+      return DR_NEED_IDR;
+  }
 
   int written = 0, length = 0, errCounter = 0, api;
   PLENTRY entry = decodeUnit->bufferList;
