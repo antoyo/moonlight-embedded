@@ -26,6 +26,7 @@
 #include "audio/audio.h"
 #include "video/video.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -62,9 +63,19 @@ enum platform platform_check(char* name) {
   #endif
   #ifdef HAVE_AML
   if (std || strcmp(name, "aml") == 0) {
+    int amvideo_available;
     void *handle = dlopen("libmoonlight-aml.so", RTLD_LAZY | RTLD_GLOBAL);
-    if (handle != NULL && access("/dev/amvideo", F_OK) != -1)
+    amvideo_available = access("/dev/amvideo", F_OK);
+    if (handle != NULL && amvideo_available != -1)
       return AML;
+    if (!std) {
+      if (handle == NULL) {
+        const char* err = dlerror();
+        fprintf(stderr, "Failed to load libmoonlight-aml.so: %s\n", err != NULL ? err : "unknown dlopen error");
+      } else if (amvideo_available == -1) {
+        fprintf(stderr, "AML backend loaded but /dev/amvideo is unavailable\n");
+      }
+    }
   }
   #endif
   #ifdef HAVE_ROCKCHIP
