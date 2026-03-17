@@ -53,10 +53,10 @@
 #define AML_DEBUG_INTERVAL_US (1000ULL * 1000ULL)
 #define AML_DEFAULT_DELAY_LIMIT_MS 16
 #define AML_DEBUG_MILESTONE_COUNT 3
-#define AML_LOW_LATENCY_PENDING_FRAMES 3
-#define AML_MAX_PENDING_FRAMES 6
-#define AML_LOW_LATENCY_RESYNC_MS 40.0
-#define AML_LOW_LATENCY_RESYNC_ARM_US (250ULL * 1000ULL)
+#define AML_LOW_LATENCY_PENDING_FRAMES 2
+#define AML_MAX_PENDING_FRAMES 4
+#define AML_FALLBACK_RESYNC_THRESHOLD_MS 24.0
+#define AML_LOW_LATENCY_RESYNC_ARM_US (125ULL * 1000ULL)
 #define AML_RESYNC_STARTUP_GRACE_US (5ULL * 1000ULL * 1000ULL)
 #define AML_RESYNC_COOLDOWN_US (1000ULL * 1000ULL)
 #define AML_STEADY_STATE_PENDING_FRAMES 1
@@ -620,6 +620,13 @@ static uint64_t aml_submit_throttle_timeout_us(void) {
       AML_DEFAULT_FRAME_DURATION_US * AML_SUBMIT_THROTTLE_TIMEOUT_FRAMES;
 }
 
+/** Returns the latency level where AML should abandon the current decoder history and resync to a fresh IDR. */
+static double aml_resync_latency_threshold_ms(void) {
+  return amlConfiguredFrameDurationUs != 0 ?
+      (amlConfiguredFrameDurationUs * 3.0) / 2000.0 :
+      AML_FALLBACK_RESYNC_THRESHOLD_MS;
+}
+
 /** Resets the FIFO of AML submit timestamps used to estimate hardware decode latency. */
 static void aml_reset_decode_submit_times(void) {
   pthread_mutex_lock(&pendingDecodeSubmitMutex);
@@ -746,6 +753,7 @@ static double aml_latest_decode_latency_ms(void) {
 /** Returns true when the AML pipeline backlog is high enough that low-latency recovery should kick in. */
 static bool aml_should_request_resync(unsigned int pending_depth) {
   double latest_latency_ms;
+  double resync_latency_threshold_ms;
   uint64_t now_us;
 
   if (!amlDisplayTrackingEnabled)
@@ -767,7 +775,8 @@ static bool aml_should_request_resync(unsigned int pending_depth) {
   }
 
   latest_latency_ms = aml_latest_decode_latency_ms();
-  if (pending_depth < AML_MAX_PENDING_FRAMES && latest_latency_ms < AML_LOW_LATENCY_RESYNC_MS) {
+  resync_latency_threshold_ms = aml_resync_latency_threshold_ms();
+  if (pending_depth < AML_MAX_PENDING_FRAMES && latest_latency_ms < resync_latency_threshold_ms) {
     amlLowLatencyResyncEligibleSinceUs = 0;
     return false;
   }
