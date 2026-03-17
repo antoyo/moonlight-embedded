@@ -52,7 +52,10 @@
 #define AML_DEBUG_INTERVAL_US (1000ULL * 1000ULL)
 #define AML_DEFAULT_DELAY_LIMIT_MS 16
 #define AML_DEBUG_MILESTONE_COUNT 3
+#define AML_LOW_LATENCY_PENDING_FRAMES 3
 #define AML_MAX_PENDING_FRAMES 6
+#define AML_LOW_LATENCY_RESYNC_MS 50.0
+#define AML_RESYNC_STARTUP_GRACE_US (5ULL * 1000ULL * 1000ULL)
 #define AML_RESYNC_COOLDOWN_US (1000ULL * 1000ULL)
 
 static codec_para_t codecParam = { 0 };
@@ -80,6 +83,7 @@ static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
 static bool amlDebugEnabled = false;
 static uint64_t amlLastResyncRequestUs = 0;
 static bool amlAwaitingIdr = false;
+static double amlLatestDecodeLatencyMs = 0.0;
 static int amlConfiguredRateX100 = 0;
 static unsigned int amlConfiguredFrameDurationTicks = 0;
 static int amlFracRatePolicy = -1;
@@ -449,6 +453,7 @@ static void aml_debug_note_frame(double decode_latency_ms, int video_delay_ms) {
   amlDebugMetrics.decode_latency_total_ms += decode_latency_ms;
   if (decode_latency_ms > amlDebugMetrics.decode_latency_max_ms)
     amlDebugMetrics.decode_latency_max_ms = decode_latency_ms;
+  amlLatestDecodeLatencyMs = decode_latency_ms;
 
   if (video_delay_ms >= 0) {
     amlDebugMetrics.video_delay_total_ms += video_delay_ms;
@@ -663,15 +668,34 @@ static unsigned int aml_pending_submit_depth(void) {
   return pending_depth;
 }
 
+/** Returns the most recent AML submit-to-output latency sample in milliseconds. */
+static double aml_latest_decode_latency_ms(void) {
+  double latest_latency_ms;
+
+  pthread_mutex_lock(&amlDebugMutex);
+
+  latest_latency_ms = amlLatestDecodeLatencyMs;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+  return latest_latency_ms;
+}
+
 /** Returns true when the AML pipeline backlog is high enough that low-latency recovery should kick in. */
 static bool aml_should_request_resync(unsigned int pending_depth) {
+  double latest_latency_ms;
   uint64_t now_us;
 
-  if (pending_depth < AML_MAX_PENDING_FRAMES)
+  if (pending_depth < AML_LOW_LATENCY_PENDING_FRAMES)
     return false;
 
   now_us = LiGetMicroseconds();
+  if (amlDebugSessionStartedUs != 0 && now_us < amlDebugSessionStartedUs + AML_RESYNC_STARTUP_GRACE_US)
+    return false;
   if (amlLastResyncRequestUs != 0 && now_us < amlLastResyncRequestUs + AML_RESYNC_COOLDOWN_US)
+    return false;
+
+  latest_latency_ms = aml_latest_decode_latency_ms();
+  if (pending_depth < AML_MAX_PENDING_FRAMES && latest_latency_ms < AML_LOW_LATENCY_RESYNC_MS)
     return false;
 
   // Throttle reset/IDR requests so a single burst of late frames cannot trap the session in a reset loop.
@@ -918,6 +942,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
   amlLastResyncRequestUs = 0;
   amlAwaitingIdr = false;
+  amlLatestDecodeLatencyMs = 0.0;
   amlConfiguredRateX100 = redrawRate * 100;
   amlConfiguredFrameDurationTicks = 0;
   amlFracRatePolicy = -1;
