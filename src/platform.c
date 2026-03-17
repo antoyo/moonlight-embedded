@@ -68,7 +68,10 @@ static int platform_parse_refresh_rate_x100(const char* mode) {
   const char* hz;
   const char* digits_end;
   const char* digits_start;
+  const char* fraction_start;
   int hz_value;
+  int fraction_value = 0;
+  int fraction_scale = 1;
 
   if (mode == NULL)
     return 0;
@@ -86,22 +89,26 @@ static int platform_parse_refresh_rate_x100(const char* mode) {
     return 0;
 
   hz_value = atoi(digits_start);
-  switch (hz_value) {
-  case 23:
-  case 24:
-    return 2397;
-  case 29:
-  case 30:
-    return 2997;
-  case 59:
-  case 60:
-    return 5994;
-  case 119:
-  case 120:
-    return 11988;
-  default:
-    return hz_value * 100;
+  fraction_start = digits_end;
+  if (*fraction_start == '.') {
+    const char* cursor = fraction_start + 1;
+
+    // Preserve explicitly reported fractional timings like 59.94Hz, but don't invent them from symbolic mode names.
+    while (isdigit((unsigned char) *cursor) && fraction_scale < 100) {
+      fraction_value = (fraction_value * 10) + (*cursor - '0');
+      fraction_scale *= 10;
+      cursor++;
+    }
+
+    if (fraction_scale == 10)
+      fraction_value *= 10;
+    else if (fraction_scale == 1)
+      fraction_value = 0;
+
+    return (hz_value * 100) + fraction_value;
   }
+
+  return hz_value * 100;
 }
 
 /** Selects the first supported runtime backend that matches the requested name. */
