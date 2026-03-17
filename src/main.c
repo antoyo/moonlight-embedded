@@ -90,6 +90,8 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   STATS_OVERLAY_CAPABILITY overlay_capability;
   VIDEO_RENDERER_CONTEXT video_context;
   int appId = get_app_id(server, config->app);
+  int original_fps;
+  int recommended_fps;
   if (appId<0) {
     fprintf(stderr, "Can't find app %s\n", config->app);
     exit(-1);
@@ -104,7 +106,27 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   for (int i = 0; i < gamepads; i++)
     gamepad_mask = (gamepad_mask << 1) + 1;
 
+  original_fps = config->stream.fps;
+  recommended_fps = platform_get_recommended_stream_fps(system, config->stream.fps);
+  if (recommended_fps != config->stream.fps) {
+    if (config->debug_level > 0) {
+      printf("Adjusting requested stream FPS from %d to %d to match the AML display cadence\n",
+          config->stream.fps, recommended_fps);
+    }
+    config->stream.fps = recommended_fps;
+  }
+
   int ret = gs_start_app(server, &config->stream, appId, config->sops, config->localaudio, gamepad_mask);
+  if (ret == GS_NOT_SUPPORTED_MODE && config->stream.fps != original_fps) {
+    // Fall back to the user-requested cadence if the host refuses the AML-specific fractional-display workaround.
+    if (config->debug_level > 0) {
+      printf("Server rejected %d FPS for AML, retrying with the requested %d FPS\n",
+          config->stream.fps, original_fps);
+    }
+    config->stream.fps = original_fps;
+    ret = gs_start_app(server, &config->stream, appId, config->sops, config->localaudio, gamepad_mask);
+  }
+
   if (ret < 0) {
     if (ret == GS_NOT_SUPPORTED_4K)
       fprintf(stderr, "Server doesn't support 4K\n");

@@ -29,10 +29,140 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <dlfcn.h>
 
 typedef bool(*ImxInit)();
+
+/** Reads the active AML display mode string from sysfs. */
+static bool platform_aml_read_display_mode(char* buffer, size_t buffer_size) {
+  static const char* paths[] = {
+    "/sys/class/display/mode",
+    "/sys/class/amhdmitx/amhdmitx0/disp_mode",
+  };
+  size_t i;
+
+  for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    char raw_mode[64];
+    int raw_length = read_file((char*) paths[i], raw_mode, sizeof(raw_mode) - 1);
+    size_t trimmed_length;
+
+    if (raw_length <= 0)
+      continue;
+
+    raw_mode[raw_length] = '\0';
+    trimmed_length = strcspn(raw_mode, "\r\n");
+    raw_mode[trimmed_length] = '\0';
+    if (raw_mode[0] == '\0')
+      continue;
+
+    snprintf(buffer, buffer_size, "%s", raw_mode);
+    return true;
+  }
+
+  return false;
+}
+
+/** Parses the refresh-rate suffix from an AML display mode string into Hz x100. */
+static bool platform_aml_parse_refresh_rate_x100(const char* display_mode, int* refresh_rate_x100) {
+  const char* hz;
+  const char* rate_start;
+  char rate_buffer[16];
+  char* end;
+  double parsed_rate;
+  size_t rate_length;
+
+  if (display_mode == NULL || refresh_rate_x100 == NULL)
+    return false;
+
+  hz = strstr(display_mode, "hz");
+  if (hz == NULL)
+    return false;
+
+  rate_start = hz;
+  while (rate_start > display_mode && (isdigit((unsigned char) rate_start[-1]) || rate_start[-1] == '.'))
+    rate_start--;
+  if (rate_start == hz)
+    return false;
+
+  // Copy only the trailing numeric rate token so strtod() can parse both 60 and 59.94 mode strings.
+  rate_length = (size_t) (hz - rate_start);
+  if (rate_length >= sizeof(rate_buffer))
+    return false;
+
+  memcpy(rate_buffer, rate_start, rate_length);
+  rate_buffer[rate_length] = '\0';
+  parsed_rate = strtod(rate_buffer, &end);
+  if (end == rate_buffer || *end != '\0' || parsed_rate <= 0.0)
+    return false;
+
+  *refresh_rate_x100 = (int) (parsed_rate * 100.0 + 0.5);
+  return true;
+}
+
+/** Reads the AML HDMI fractional refresh-rate policy when the driver exposes it. */
+static bool platform_aml_read_frac_rate_policy(int* frac_rate_policy) {
+  char buffer[16];
+  int length;
+  char* end;
+  long parsed_value;
+
+  if (frac_rate_policy == NULL)
+    return false;
+
+  length = read_file("/sys/class/amhdmitx/amhdmitx0/frac_rate_policy", buffer, sizeof(buffer) - 1);
+  if (length <= 0)
+    return false;
+
+  buffer[length] = '\0';
+  parsed_value = strtol(buffer, &end, 10);
+  if (end == buffer)
+    return false;
+
+  *frac_rate_policy = (int) parsed_value;
+  return true;
+}
+
+/** Returns the common fractional AML HDMI refresh rate x100 for a nominal integer mode. */
+static int platform_aml_fractional_refresh_x100_for_nominal(int nominal_refresh_hz) {
+  switch (nominal_refresh_hz) {
+  case 24:
+    return 2398;
+  case 30:
+    return 2997;
+  case 60:
+    return 5994;
+  case 120:
+    return 11988;
+  default:
+    return 0;
+  }
+}
+
+/** Detects the AML display refresh rate in Hz x100 using both the mode string and fractional-rate policy. */
+static int platform_aml_detect_refresh_rate_x100(void) {
+  char display_mode[64];
+  int refresh_rate_x100;
+  int frac_rate_policy;
+
+  if (!platform_aml_read_display_mode(display_mode, sizeof(display_mode)))
+    return 0;
+  if (!platform_aml_parse_refresh_rate_x100(display_mode, &refresh_rate_x100))
+    return 0;
+
+  if (platform_aml_read_frac_rate_policy(&frac_rate_policy) &&
+      frac_rate_policy != 0 &&
+      refresh_rate_x100 % 100 == 0) {
+    int fractional_rate_x100 = platform_aml_fractional_refresh_x100_for_nominal(refresh_rate_x100 / 100);
+
+    // AML commonly reports 1080p60hz while the HDMI block actually runs at 59.94 Hz with fractional mode enabled.
+    if (fractional_rate_x100 != 0)
+      return fractional_rate_x100;
+  }
+
+  return refresh_rate_x100;
+}
 
 /** Selects the first supported runtime backend that matches the requested name. */
 enum platform platform_check(char* name) {
@@ -301,5 +431,20 @@ int platform_get_client_refresh_rate_x100(enum platform system) {
     return 0;
   default:
     return 0;
+  }
+}
+
+/** Returns a backend-specific stream FPS that better matches the active display cadence. */
+int platform_get_recommended_stream_fps(enum platform system, int requested_fps) {
+  switch (system) {
+  case AML: {
+    int refresh_rate_x100 = platform_aml_detect_refresh_rate_x100();
+
+    if (requested_fps == 60 && refresh_rate_x100 >= 5990 && refresh_rate_x100 <= 5998)
+      return 59;
+    return requested_fps;
+  }
+  default:
+    return requested_fps;
   }
 }
