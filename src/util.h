@@ -20,13 +20,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/** Writes a boolean sysfs-style value to a file path. */
 int write_bool(char *path, bool val);
-/** Writes a complete string value to a file path. */
-int write_string(char *path, const char *val);
-/** Reads bytes from a file path into the provided buffer. */
 int read_file(char *path, char *output, int output_len);
-/** Grows a heap buffer to at least the requested size. */
 bool ensure_buf_size(void **buf, size_t *buf_size, size_t required_size);
-/** Returns true when the CPU supports a fast AES implementation. */
 bool has_fast_aes(void);

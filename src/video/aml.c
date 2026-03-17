@@ -87,8 +87,6 @@ static double amlLatestDecodeLatencyMs = 0.0;
 static int amlConfiguredRateX100 = 0;
 static unsigned int amlConfiguredFrameDurationTicks = 0;
 static int amlFracRatePolicy = -1;
-static bool amlLowLatencyVfmApplied = false;
-static char amlOriginalVfmChain[256];
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -366,164 +364,6 @@ static unsigned int aml_frame_duration_ticks(int redrawRate) {
 
   amlConfiguredRateX100 = detected_rate_x100;
   return (96000U * 100U + (unsigned int) (detected_rate_x100 / 2)) / (unsigned int) detected_rate_x100;
-}
-
-/** Extracts the default AML VFM chain into a space-separated provider list. */
-static bool aml_extract_default_vfm_chain(const char* vfm_map, char* chain, size_t chain_size) {
-  const char* default_map;
-  const char* start;
-  const char* end;
-  size_t written = 0;
-
-  if (vfm_map == NULL || chain == NULL || chain_size == 0)
-    return false;
-
-  default_map = strstr(vfm_map, "default");
-  if (default_map == NULL)
-    return false;
-
-  start = strchr(default_map, '{');
-  if (start == NULL)
-    return false;
-  start++;
-
-  end = strchr(start, '}');
-  if (end == NULL || end <= start)
-    return false;
-
-  chain[0] = '\0';
-  while (start < end) {
-    const char* token_start;
-    size_t token_length;
-
-    while (start < end && isspace((unsigned char) *start))
-      start++;
-    if (start >= end)
-      break;
-
-    token_start = start;
-    while (start < end && !isspace((unsigned char) *start) && *start != '(')
-      start++;
-    token_length = (size_t) (start - token_start);
-    if (token_length == 0)
-      break;
-
-    // Strip the refcount suffix so the restored chain can be fed back to "add default ..." later.
-    if (written != 0) {
-      if (written + 1 >= chain_size)
-        return false;
-      chain[written++] = ' ';
-    }
-    if (written + token_length >= chain_size)
-      return false;
-    memcpy(chain + written, token_start, token_length);
-    written += token_length;
-    chain[written] = '\0';
-
-    while (start < end && !isspace((unsigned char) *start))
-      start++;
-  }
-
-  return written != 0;
-}
-
-/** Builds a lower-latency AML VFM chain by removing the deinterlacer stage for progressive game streams. */
-static bool aml_build_low_latency_vfm_chain(const char* original_chain, char* low_latency_chain, size_t chain_size) {
-  char chain_copy[256];
-  char* saveptr = NULL;
-  char* token;
-  bool removed_deinterlace = false;
-  bool has_amlvideo = false;
-  bool has_amvideo = false;
-  size_t written = 0;
-
-  if (original_chain == NULL || low_latency_chain == NULL || chain_size == 0)
-    return false;
-
-  snprintf(chain_copy, sizeof(chain_copy), "%s", original_chain);
-  low_latency_chain[0] = '\0';
-  token = strtok_r(chain_copy, " ", &saveptr);
-  while (token != NULL) {
-    if (strcmp(token, "deinterlace") == 0) {
-      removed_deinterlace = true;
-      token = strtok_r(NULL, " ", &saveptr);
-      continue;
-    }
-
-    if (strcmp(token, "amlvideo") == 0)
-      has_amlvideo = true;
-    else if (strcmp(token, "amvideo") == 0)
-      has_amvideo = true;
-
-    // Preserve the original provider order and only remove the unwanted deinterlacer stage.
-    if (written != 0) {
-      if (written + 1 >= chain_size)
-        return false;
-      low_latency_chain[written++] = ' ';
-    }
-    if (written + strlen(token) >= chain_size)
-      return false;
-    memcpy(low_latency_chain + written, token, strlen(token));
-    written += strlen(token);
-    low_latency_chain[written] = '\0';
-
-    token = strtok_r(NULL, " ", &saveptr);
-  }
-
-  return removed_deinterlace && has_amlvideo && has_amvideo;
-}
-
-/** Applies a lower-latency AML VFM map and saves the original default chain for cleanup restoration. */
-static void aml_apply_low_latency_vfm_map(void) {
-  char vfm_map[2048];
-  char low_latency_chain[256];
-  char command[320];
-  int map_length;
-
-  amlLowLatencyVfmApplied = false;
-  amlOriginalVfmChain[0] = '\0';
-
-  map_length = read_file("/sys/class/vfm/map", vfm_map, sizeof(vfm_map) - 1);
-  if (map_length <= 0)
-    return;
-  vfm_map[map_length] = '\0';
-
-  if (!aml_extract_default_vfm_chain(vfm_map, amlOriginalVfmChain, sizeof(amlOriginalVfmChain)))
-    return;
-  if (!aml_build_low_latency_vfm_chain(amlOriginalVfmChain, low_latency_chain, sizeof(low_latency_chain)))
-    return;
-  if (strcmp(amlOriginalVfmChain, low_latency_chain) == 0)
-    return;
-
-  if (write_string("/sys/class/vfm/map", "rm default") != 0)
-    return;
-
-  snprintf(command, sizeof(command), "add default %s", low_latency_chain);
-  if (write_string("/sys/class/vfm/map", command) != 0) {
-    // Restore the prior map immediately if the low-latency rewrite fails after removing the default entry.
-    snprintf(command, sizeof(command), "add default %s", amlOriginalVfmChain);
-    write_string("/sys/class/vfm/map", command);
-    amlOriginalVfmChain[0] = '\0';
-    return;
-  }
-
-  amlLowLatencyVfmApplied = true;
-  if (aml_debug_enabled())
-    printf("AML debug: rewrote VFM default chain from '%s' to '%s'\n", amlOriginalVfmChain, low_latency_chain);
-}
-
-/** Restores the AML VFM default chain that was active before low-latency streaming started. */
-static void aml_restore_vfm_map(void) {
-  char command[320];
-
-  if (!amlLowLatencyVfmApplied || amlOriginalVfmChain[0] == '\0')
-    return;
-
-  write_string("/sys/class/vfm/map", "rm default");
-  snprintf(command, sizeof(command), "add default %s", amlOriginalVfmChain);
-  write_string("/sys/class/vfm/map", command);
-  amlLowLatencyVfmApplied = false;
-  amlOriginalVfmChain[0] = '\0';
 }
 
 /** Discovers optional AML low-latency helper entry points from the linked amcodec library. */
@@ -1106,8 +946,6 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlConfiguredRateX100 = redrawRate * 100;
   amlConfiguredFrameDurationTicks = 0;
   amlFracRatePolicy = -1;
-  amlLowLatencyVfmApplied = false;
-  amlOriginalVfmChain[0] = '\0';
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   aml_optional_apis_init();
   aml_reset_decode_submit_times();
@@ -1183,7 +1021,6 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
     return -2;
   }
   aml_apply_latency_controls();
-  aml_apply_low_latency_vfm_map();
   aml_debug_log_setup_state();
 
   char vfm_map[2048] = {};
@@ -1220,7 +1057,6 @@ void aml_cleanup() {
   }
 
   aml_debug_log_exit_summary();
-  aml_restore_vfm_map();
   codec_close(&codecParam);
   free(pkt_buf);
   pkt_buf = NULL;
