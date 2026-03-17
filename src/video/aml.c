@@ -54,7 +54,8 @@
 #define AML_DEBUG_MILESTONE_COUNT 3
 #define AML_LOW_LATENCY_PENDING_FRAMES 3
 #define AML_MAX_PENDING_FRAMES 6
-#define AML_LOW_LATENCY_RESYNC_MS 50.0
+#define AML_LOW_LATENCY_RESYNC_MS 40.0
+#define AML_LOW_LATENCY_RESYNC_ARM_US (250ULL * 1000ULL)
 #define AML_RESYNC_STARTUP_GRACE_US (5ULL * 1000ULL * 1000ULL)
 #define AML_RESYNC_COOLDOWN_US (1000ULL * 1000ULL)
 
@@ -82,6 +83,7 @@ static uint32_t overlayBgColor = 0;
 static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
 static bool amlDebugEnabled = false;
 static uint64_t amlLastResyncRequestUs = 0;
+static uint64_t amlLowLatencyResyncEligibleSinceUs = 0;
 static bool amlAwaitingIdr = false;
 static double amlLatestDecodeLatencyMs = 0.0;
 static int amlConfiguredRateX100 = 0;
@@ -685,21 +687,38 @@ static bool aml_should_request_resync(unsigned int pending_depth) {
   double latest_latency_ms;
   uint64_t now_us;
 
-  if (pending_depth < AML_LOW_LATENCY_PENDING_FRAMES)
+  if (pending_depth < AML_LOW_LATENCY_PENDING_FRAMES) {
+    amlLowLatencyResyncEligibleSinceUs = 0;
     return false;
+  }
 
   now_us = LiGetMicroseconds();
-  if (amlDebugSessionStartedUs != 0 && now_us < amlDebugSessionStartedUs + AML_RESYNC_STARTUP_GRACE_US)
+  if (amlDebugSessionStartedUs != 0 && now_us < amlDebugSessionStartedUs + AML_RESYNC_STARTUP_GRACE_US) {
+    amlLowLatencyResyncEligibleSinceUs = 0;
     return false;
-  if (amlLastResyncRequestUs != 0 && now_us < amlLastResyncRequestUs + AML_RESYNC_COOLDOWN_US)
+  }
+  if (amlLastResyncRequestUs != 0 && now_us < amlLastResyncRequestUs + AML_RESYNC_COOLDOWN_US) {
+    amlLowLatencyResyncEligibleSinceUs = 0;
     return false;
+  }
 
   latest_latency_ms = aml_latest_decode_latency_ms();
-  if (pending_depth < AML_MAX_PENDING_FRAMES && latest_latency_ms < AML_LOW_LATENCY_RESYNC_MS)
+  if (pending_depth < AML_MAX_PENDING_FRAMES && latest_latency_ms < AML_LOW_LATENCY_RESYNC_MS) {
+    amlLowLatencyResyncEligibleSinceUs = 0;
+    return false;
+  }
+
+  if (amlLowLatencyResyncEligibleSinceUs == 0) {
+    // Arm recovery only after the queue remains above the low-latency threshold long enough to rule out transient spikes.
+    amlLowLatencyResyncEligibleSinceUs = now_us;
+    return false;
+  }
+  if (now_us < amlLowLatencyResyncEligibleSinceUs + AML_LOW_LATENCY_RESYNC_ARM_US)
     return false;
 
   // Throttle reset/IDR requests so a single burst of late frames cannot trap the session in a reset loop.
   amlLastResyncRequestUs = now_us;
+  amlLowLatencyResyncEligibleSinceUs = 0;
   return true;
 }
 
@@ -941,6 +960,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   done = false;
   amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
   amlLastResyncRequestUs = 0;
+  amlLowLatencyResyncEligibleSinceUs = 0;
   amlAwaitingIdr = false;
   amlLatestDecodeLatencyMs = 0.0;
   amlConfiguredRateX100 = redrawRate * 100;
