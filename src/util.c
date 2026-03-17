@@ -25,7 +25,9 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <string.h>
 
+/** Writes a boolean sysfs-style value to a file path. */
 int write_bool(char *path, bool val) {
   int fd = open(path, O_RDWR);
 
@@ -40,6 +42,27 @@ int write_bool(char *path, bool val) {
     return -1;
 }
 
+/** Writes a complete string value to a file path. */
+int write_string(char *path, const char *val) {
+  int fd = open(path, O_RDWR);
+
+  if (fd >= 0) {
+    size_t length = strlen(val);
+    ssize_t ret = write(fd, val, length);
+
+    if (ret < 0 || (size_t) ret != length) {
+      fprintf(stderr, "Failed to write '%s' to %s\n", val, path);
+      close(fd);
+      return -1;
+    }
+
+    close(fd);
+    return 0;
+  } else
+    return -1;
+}
+
+/** Reads bytes from a file path into the provided buffer. */
 int read_file(char *path, char* output, int output_len) {
   int fd = open(path, O_RDONLY);
 
@@ -51,6 +74,7 @@ int read_file(char *path, char* output, int output_len) {
     return -1;
 }
 
+/** Grows a heap buffer to at least the requested size. */
 bool ensure_buf_size(void **buf, size_t *buf_size, size_t required_size) {
   if (*buf_size >= required_size)
     return false;
