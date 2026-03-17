@@ -79,6 +79,7 @@ static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
 static bool amlDebugEnabled = false;
 static uint64_t amlLastResyncRequestUs = 0;
 static bool amlAwaitingIdr = false;
+static bool amlUsePts = true;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -254,8 +255,13 @@ static void aml_optional_apis_init(void) {
 static void aml_apply_latency_controls(void) {
   if (amlOptionalApis.set_syncenable != NULL) {
     int ret = amlOptionalApis.set_syncenable(&codecParam, 0);
-    if (ret != 0 && aml_debug_enabled())
-      printf("AML debug: codec_set_syncenable(0) failed: %d\n", ret);
+    if (ret != 0) {
+      if (aml_debug_enabled())
+        printf("AML debug: codec_set_syncenable(0) failed: %d\n", ret);
+    } else {
+      // Once AML sync is disabled, avoid feeding device PTS values that can reintroduce hidden scheduling delay.
+      amlUsePts = false;
+    }
   }
 
   if (amlOptionalApis.disable_slowsync != NULL) {
@@ -394,12 +400,15 @@ static void aml_debug_log_setup_state(void) {
   if (!aml_debug_enabled())
     return;
 
-  printf("AML debug: target video delay %d ms, overlay %s, optional APIs delay_limit=%s cur_delay_ms=%s cur_delay_frames=%s disable_slowsync=%s%s%s\n",
+  printf("AML debug: target video delay %d ms, overlay %s, optional APIs delay_limit=%s cur_delay_ms=%s "
+         "cur_delay_frames=%s disable_slowsync=%s syncenable_off=%s, pts_checkin=%s%s%s\n",
       amlTargetDelayMs, overlayEnabled ? "on" : "off",
       amlOptionalApis.set_video_delay_limited_ms != NULL ? "yes" : "no",
       amlOptionalApis.get_video_cur_delay_ms != NULL ? "yes" : "no",
       amlOptionalApis.get_video_cur_delay_frames != NULL ? "yes" : "no",
       amlOptionalApis.disable_slowsync != NULL ? "yes" : "no",
+      amlOptionalApis.set_syncenable != NULL ? "yes" : "no",
+      amlUsePts ? "on" : "off",
       amlDebugMetrics.display_mode[0] != '\0' ? ", display mode " : "",
       amlDebugMetrics.display_mode[0] != '\0' ? amlDebugMetrics.display_mode : "");
 }
@@ -784,6 +793,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
   amlLastResyncRequestUs = 0;
   amlAwaitingIdr = false;
+  amlUsePts = true;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   aml_optional_apis_init();
   aml_reset_decode_submit_times();
@@ -948,9 +958,9 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
     entry = entry->next;
   } while (entry != NULL);
 
-  // AML amcodec expects PTS in milliseconds, so convert the Moonlight microsecond timestamp by dividing by 1000.
-  // presentationTimeUs is in microseconds; amcodec expects milliseconds.
-  codec_checkin_pts(&codecParam, decodeUnit->presentationTimeUs / 1000);
+  // With AML sync disabled, checking in PTS can reintroduce timestamp-based buffering.
+  if (amlUsePts)
+    codec_checkin_pts(&codecParam, decodeUnit->presentationTimeUs / 1000);
   submit_started_us = LiGetMicroseconds();
   write_started_us = submit_started_us;
   while (length > 0) {
