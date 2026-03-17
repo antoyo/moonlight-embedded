@@ -33,10 +33,13 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <poll.h>
+#include <dlfcn.h>
 
 #include <linux/videodev2.h>
 #include <linux/fb.h>
 
+#include "../connection.h"
 #include "../stats_overlay.h"
 #include "../util.h"
 #include "video.h"
@@ -45,11 +48,17 @@
 #define UCODE_IP_ONLY_PARAM 0x08
 #define MAX_WRITE_ATTEMPTS 5
 #define EAGAIN_SLEEP_TIME 2 * 1000
+#define AML_DQBUF_POLL_TIMEOUT_MS 20
+#define AML_DEBUG_INTERVAL_US (1000ULL * 1000ULL)
+#define AML_DEFAULT_DELAY_LIMIT_MS 16
+#define AML_DEBUG_MILESTONE_COUNT 3
 
 static codec_para_t codecParam = { 0 };
 static pthread_t displayThread;
 static int videoFd = -1;
 static volatile bool done = false;
+static pthread_mutex_t pendingDecodeSubmitMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t amlDebugMutex = PTHREAD_MUTEX_INITIALIZER;
 static int overlayFd = -1;
 static uint32_t* overlayPixels = NULL;
 static size_t overlayMapSize = 0;
@@ -65,8 +74,334 @@ static bool overlayReady = false;
 static bool overlayWarningEmitted = false;
 static uint32_t overlayFgColor = 0;
 static uint32_t overlayBgColor = 0;
+static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
+
+typedef int (*AmlCodecSetVideoDelayLimitedMs)(codec_para_t*, int);
+typedef int (*AmlCodecGetVideoCurDelayMs)(codec_para_t*, int*);
+typedef int (*AmlCodecGetVideoCurDelayFrames)(codec_para_t*, int*);
+typedef int (*AmlCodecDisableSlowsync)(codec_para_t*, int);
+
+typedef struct _AML_OPTIONAL_APIS {
+  AmlCodecSetVideoDelayLimitedMs set_video_delay_limited_ms;
+  AmlCodecGetVideoCurDelayMs get_video_cur_delay_ms;
+  AmlCodecGetVideoCurDelayFrames get_video_cur_delay_frames;
+  AmlCodecDisableSlowsync disable_slowsync;
+} AML_OPTIONAL_APIS;
+
+typedef struct _AML_DEBUG_METRICS {
+  uint64_t window_started_us;
+  uint64_t codec_write_total_us;
+  uint64_t codec_write_stall_us;
+  uint64_t dqbuf_poll_timeout_count;
+  unsigned int codec_write_count;
+  unsigned int codec_write_eagain_count;
+  unsigned int decoded_frame_count;
+  unsigned int submit_fifo_depth_max;
+  double decode_latency_total_ms;
+  double decode_latency_max_ms;
+  double video_delay_total_ms;
+  unsigned int video_delay_sample_count;
+  int video_delay_max_ms;
+  int video_delay_last_ms;
+  char display_mode[64];
+} AML_DEBUG_METRICS;
+
+typedef struct _AML_DEBUG_SNAPSHOT {
+  bool captured;
+  unsigned int elapsed_seconds;
+  double frame_rate;
+  double avg_decode_latency_ms;
+  double max_decode_latency_ms;
+  double avg_video_delay_ms;
+  int max_video_delay_ms;
+  int last_video_delay_ms;
+  double avg_write_ms;
+  double avg_stall_ms;
+  unsigned int write_eagain_count;
+  uint64_t dqbuf_poll_timeout_count;
+  unsigned int submit_fifo_depth_max;
+  char display_mode[64];
+} AML_DEBUG_SNAPSHOT;
+
+static AML_OPTIONAL_APIS amlOptionalApis;
+static AML_DEBUG_METRICS amlDebugMetrics;
+static AML_DEBUG_SNAPSHOT amlDebugSnapshots[AML_DEBUG_MILESTONE_COUNT];
+static uint64_t amlDebugSessionStartedUs = 0;
+static const unsigned int amlDebugMilestoneSeconds[AML_DEBUG_MILESTONE_COUNT] = { 60U, 180U, 300U };
+
+/** Returns true when the session is running with debug logging enabled. */
+static bool aml_debug_enabled(void) {
+  return connection_debug;
+}
+
+/** Returns the configured one-frame video-delay target for the active stream. */
+static int aml_target_delay_ms(int redrawRate) {
+  if (redrawRate <= 0)
+    return AML_DEFAULT_DELAY_LIMIT_MS;
+
+  // Clamp the target to one frame so 60 FPS aims for roughly 16 ms while slower modes keep a realistic floor.
+  return redrawRate > 1000 ? 1 : 1000 / redrawRate;
+}
+
+/** Resets the per-second AML debug counters while preserving static display metadata. */
+static void aml_debug_reset_window(uint64_t now_us) {
+  char display_mode[sizeof(amlDebugMetrics.display_mode)];
+
+  // Preserve the cached display mode string so it can be printed in every summary without re-reading sysfs.
+  snprintf(display_mode, sizeof(display_mode), "%s", amlDebugMetrics.display_mode);
+  memset(&amlDebugMetrics, 0, sizeof(amlDebugMetrics));
+  amlDebugMetrics.window_started_us = now_us;
+  snprintf(amlDebugMetrics.display_mode, sizeof(amlDebugMetrics.display_mode), "%s", display_mode);
+}
+
+/** Stores the current one-second AML debug window as a milestone snapshot. */
+static void aml_debug_fill_snapshot_locked(AML_DEBUG_SNAPSHOT* snapshot, uint64_t now_us, unsigned int elapsed_seconds) {
+  double elapsed_window_seconds;
+
+  // Keep the exit summary numerically comparable to the once-per-second AML debug log line.
+  elapsed_window_seconds = amlDebugMetrics.window_started_us != 0 && now_us > amlDebugMetrics.window_started_us ?
+      (now_us - amlDebugMetrics.window_started_us) / 1000000.0 : 0.0;
+
+  snapshot->captured = true;
+  snapshot->elapsed_seconds = elapsed_seconds;
+  snapshot->frame_rate = elapsed_window_seconds > 0.0 ? amlDebugMetrics.decoded_frame_count / elapsed_window_seconds : 0.0;
+  snapshot->avg_decode_latency_ms = amlDebugMetrics.decoded_frame_count != 0 ?
+      amlDebugMetrics.decode_latency_total_ms / amlDebugMetrics.decoded_frame_count : 0.0;
+  snapshot->max_decode_latency_ms = amlDebugMetrics.decode_latency_max_ms;
+  snapshot->avg_video_delay_ms = amlDebugMetrics.video_delay_sample_count != 0 ?
+      amlDebugMetrics.video_delay_total_ms / amlDebugMetrics.video_delay_sample_count : 0.0;
+  snapshot->max_video_delay_ms = amlDebugMetrics.video_delay_max_ms;
+  snapshot->last_video_delay_ms = amlDebugMetrics.video_delay_last_ms;
+  snapshot->avg_write_ms = amlDebugMetrics.codec_write_count != 0 ?
+      (amlDebugMetrics.codec_write_total_us / 1000.0) / amlDebugMetrics.codec_write_count : 0.0;
+  snapshot->avg_stall_ms = amlDebugMetrics.codec_write_count != 0 ?
+      (amlDebugMetrics.codec_write_stall_us / 1000.0) / amlDebugMetrics.codec_write_count : 0.0;
+  snapshot->write_eagain_count = amlDebugMetrics.codec_write_eagain_count;
+  snapshot->dqbuf_poll_timeout_count = amlDebugMetrics.dqbuf_poll_timeout_count;
+  snapshot->submit_fifo_depth_max = amlDebugMetrics.submit_fifo_depth_max;
+  snprintf(snapshot->display_mode, sizeof(snapshot->display_mode), "%s", amlDebugMetrics.display_mode);
+}
+
+/** Captures 1/3/5-minute AML debug snapshots the first time each milestone is crossed. */
+static void aml_debug_capture_milestones_locked(uint64_t now_us) {
+  unsigned int elapsed_seconds;
+  unsigned int i;
+
+  if (amlDebugSessionStartedUs == 0)
+    return;
+
+  elapsed_seconds = (unsigned int) ((now_us - amlDebugSessionStartedUs) / 1000000ULL);
+  for (i = 0; i < AML_DEBUG_MILESTONE_COUNT; i++) {
+    // Capture the first one-second window that reaches each milestone so the exit summary mirrors what the live logs showed then.
+    if (!amlDebugSnapshots[i].captured && elapsed_seconds >= amlDebugMilestoneSeconds[i])
+      aml_debug_fill_snapshot_locked(&amlDebugSnapshots[i], now_us, elapsed_seconds);
+  }
+}
+
+/** Reads and trims a short AML display-mode string from sysfs when available. */
+static bool aml_read_display_mode(char* buffer, size_t buffer_size) {
+  static const char* paths[] = {
+    "/sys/class/display/mode",
+    "/sys/class/amhdmitx/amhdmitx0/disp_mode",
+  };
+  size_t i;
+
+  for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    char raw_mode[64];
+    size_t len;
+
+    if (read_file((char*) paths[i], raw_mode, sizeof(raw_mode) - 1) <= 0)
+      continue;
+
+    raw_mode[sizeof(raw_mode) - 1] = '\0';
+    len = strcspn(raw_mode, "\r\n");
+    raw_mode[len] = '\0';
+    if (raw_mode[0] == '\0')
+      continue;
+
+    snprintf(buffer, buffer_size, "%s", raw_mode);
+    return true;
+  }
+
+  return false;
+}
+
+/** Discovers optional AML low-latency helper entry points from the linked amcodec library. */
+static void aml_optional_apis_init(void) {
+  amlOptionalApis.set_video_delay_limited_ms = (AmlCodecSetVideoDelayLimitedMs) dlsym(RTLD_DEFAULT, "codec_set_video_delay_limited_ms");
+  amlOptionalApis.get_video_cur_delay_ms = (AmlCodecGetVideoCurDelayMs) dlsym(RTLD_DEFAULT, "codec_get_video_cur_delay_ms");
+  amlOptionalApis.get_video_cur_delay_frames = (AmlCodecGetVideoCurDelayFrames) dlsym(RTLD_DEFAULT, "codec_get_video_cur_delay_frames");
+  amlOptionalApis.disable_slowsync = (AmlCodecDisableSlowsync) dlsym(RTLD_DEFAULT, "codec_disalbe_slowsync");
+}
+
+/** Applies optional AML low-latency controls when the runtime amcodec build exposes them. */
+static void aml_apply_latency_controls(void) {
+  if (amlOptionalApis.disable_slowsync != NULL) {
+    int ret = amlOptionalApis.disable_slowsync(&codecParam, 1);
+    if (ret != 0 && aml_debug_enabled())
+      printf("AML debug: codec_disalbe_slowsync failed: %d\n", ret);
+  }
+
+  if (amlOptionalApis.set_video_delay_limited_ms != NULL) {
+    int ret = amlOptionalApis.set_video_delay_limited_ms(&codecParam, amlTargetDelayMs);
+    if (ret != 0 && aml_debug_enabled())
+      printf("AML debug: codec_set_video_delay_limited_ms(%d) failed: %d\n", amlTargetDelayMs, ret);
+  }
+}
+
+/** Updates the high-water mark for queued AML submit timestamps. */
+static void aml_debug_note_submit_depth(unsigned int submit_depth) {
+  pthread_mutex_lock(&amlDebugMutex);
+
+  if (submit_depth > amlDebugMetrics.submit_fifo_depth_max)
+    amlDebugMetrics.submit_fifo_depth_max = submit_depth;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
+/** Records the cost of a codec_write loop, including how much time was spent stalled on EAGAIN. */
+static void aml_debug_note_codec_write(uint64_t write_elapsed_us, uint64_t stall_elapsed_us, unsigned int eagain_count) {
+  pthread_mutex_lock(&amlDebugMutex);
+
+  if (amlDebugMetrics.window_started_us == 0)
+    amlDebugMetrics.window_started_us = LiGetMicroseconds();
+
+  amlDebugMetrics.codec_write_total_us += write_elapsed_us;
+  amlDebugMetrics.codec_write_stall_us += stall_elapsed_us;
+  amlDebugMetrics.codec_write_eagain_count += eagain_count;
+  amlDebugMetrics.codec_write_count++;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
+/** Notes that the AML display thread waited a poll interval without a decoded frame becoming ready. */
+static void aml_debug_note_dqbuf_poll_timeout(void) {
+  pthread_mutex_lock(&amlDebugMutex);
+
+  if (amlDebugMetrics.window_started_us == 0)
+    amlDebugMetrics.window_started_us = LiGetMicroseconds();
+
+  amlDebugMetrics.dqbuf_poll_timeout_count++;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
+/** Records AML pipeline-latency samples and emits a once-per-second summary when debug is active. */
+static void aml_debug_note_frame(double decode_latency_ms, int video_delay_ms) {
+  uint64_t now_us = LiGetMicroseconds();
+
+  pthread_mutex_lock(&amlDebugMutex);
+
+  if (amlDebugMetrics.window_started_us == 0)
+    aml_debug_reset_window(now_us);
+
+  amlDebugMetrics.decoded_frame_count++;
+  amlDebugMetrics.decode_latency_total_ms += decode_latency_ms;
+  if (decode_latency_ms > amlDebugMetrics.decode_latency_max_ms)
+    amlDebugMetrics.decode_latency_max_ms = decode_latency_ms;
+
+  if (video_delay_ms >= 0) {
+    amlDebugMetrics.video_delay_total_ms += video_delay_ms;
+    amlDebugMetrics.video_delay_sample_count++;
+    amlDebugMetrics.video_delay_last_ms = video_delay_ms;
+    if (video_delay_ms > amlDebugMetrics.video_delay_max_ms)
+      amlDebugMetrics.video_delay_max_ms = video_delay_ms;
+  }
+
+  aml_debug_capture_milestones_locked(now_us);
+
+  if (aml_debug_enabled() && now_us >= amlDebugMetrics.window_started_us + AML_DEBUG_INTERVAL_US) {
+    double elapsed_seconds = (now_us - amlDebugMetrics.window_started_us) / 1000000.0;
+    double frame_rate = elapsed_seconds > 0.0 ? amlDebugMetrics.decoded_frame_count / elapsed_seconds : 0.0;
+    double avg_decode_latency_ms = amlDebugMetrics.decoded_frame_count != 0 ?
+        amlDebugMetrics.decode_latency_total_ms / amlDebugMetrics.decoded_frame_count : 0.0;
+    double avg_write_ms = amlDebugMetrics.codec_write_count != 0 ?
+        (amlDebugMetrics.codec_write_total_us / 1000.0) / amlDebugMetrics.codec_write_count : 0.0;
+    double avg_stall_ms = amlDebugMetrics.codec_write_count != 0 ?
+        (amlDebugMetrics.codec_write_stall_us / 1000.0) / amlDebugMetrics.codec_write_count : 0.0;
+    double avg_video_delay_ms = amlDebugMetrics.video_delay_sample_count != 0 ?
+        amlDebugMetrics.video_delay_total_ms / amlDebugMetrics.video_delay_sample_count : 0.0;
+
+    // Emit one compact line so long-running Vero V sessions can reveal whether latency is drifting or being clamped.
+    printf("AML debug: %.1f fps, submit->output avg %.2f ms max %.2f ms, "
+           "amcodec delay avg %.2f ms max %d ms last %d ms, codec_write avg %.2f ms stall %.2f ms, "
+           "write EAGAIN %u, DQBUF poll timeouts %llu, submit FIFO max %u%s%s\n",
+        frame_rate, avg_decode_latency_ms, amlDebugMetrics.decode_latency_max_ms,
+        avg_video_delay_ms, amlDebugMetrics.video_delay_max_ms, amlDebugMetrics.video_delay_last_ms,
+        avg_write_ms, avg_stall_ms, amlDebugMetrics.codec_write_eagain_count,
+        (unsigned long long) amlDebugMetrics.dqbuf_poll_timeout_count, amlDebugMetrics.submit_fifo_depth_max,
+        amlDebugMetrics.display_mode[0] != '\0' ? ", display mode " : "",
+        amlDebugMetrics.display_mode[0] != '\0' ? amlDebugMetrics.display_mode : "");
+    aml_debug_reset_window(now_us);
+  }
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
+/** Prints one AML milestone snapshot in the same format as the live debug line. */
+static void aml_debug_print_snapshot(const char* label, const AML_DEBUG_SNAPSHOT* snapshot) {
+  if (!snapshot->captured) {
+    printf("AML debug snapshot %s: not reached\n", label);
+    return;
+  }
+
+  printf("AML debug snapshot %s (%us): %.1f fps, submit->output avg %.2f ms max %.2f ms, "
+         "amcodec delay avg %.2f ms max %d ms last %d ms, codec_write avg %.2f ms stall %.2f ms, "
+         "write EAGAIN %u, DQBUF poll timeouts %llu, submit FIFO max %u%s%s\n",
+      label, snapshot->elapsed_seconds, snapshot->frame_rate,
+      snapshot->avg_decode_latency_ms, snapshot->max_decode_latency_ms,
+      snapshot->avg_video_delay_ms, snapshot->max_video_delay_ms, snapshot->last_video_delay_ms,
+      snapshot->avg_write_ms, snapshot->avg_stall_ms, snapshot->write_eagain_count,
+      (unsigned long long) snapshot->dqbuf_poll_timeout_count, snapshot->submit_fifo_depth_max,
+      snapshot->display_mode[0] != '\0' ? ", display mode " : "",
+      snapshot->display_mode[0] != '\0' ? snapshot->display_mode : "");
+}
+
+/** Logs the AML display mode and the availability of optional latency-control APIs. */
+static void aml_debug_log_setup_state(void) {
+  pthread_mutex_lock(&amlDebugMutex);
+
+  memset(amlDebugSnapshots, 0, sizeof(amlDebugSnapshots));
+  amlDebugSessionStartedUs = LiGetMicroseconds();
+  if (!aml_read_display_mode(amlDebugMetrics.display_mode, sizeof(amlDebugMetrics.display_mode)))
+    amlDebugMetrics.display_mode[0] = '\0';
+
+  aml_debug_reset_window(amlDebugSessionStartedUs);
+  pthread_mutex_unlock(&amlDebugMutex);
+
+  if (!aml_debug_enabled())
+    return;
+
+  printf("AML debug: target video delay %d ms, overlay %s, optional APIs delay_limit=%s cur_delay_ms=%s cur_delay_frames=%s disable_slowsync=%s%s%s\n",
+      amlTargetDelayMs, overlayEnabled ? "on" : "off",
+      amlOptionalApis.set_video_delay_limited_ms != NULL ? "yes" : "no",
+      amlOptionalApis.get_video_cur_delay_ms != NULL ? "yes" : "no",
+      amlOptionalApis.get_video_cur_delay_frames != NULL ? "yes" : "no",
+      amlOptionalApis.disable_slowsync != NULL ? "yes" : "no",
+      amlDebugMetrics.display_mode[0] != '\0' ? ", display mode " : "",
+      amlDebugMetrics.display_mode[0] != '\0' ? amlDebugMetrics.display_mode : "");
+}
+
+/** Prints the recorded AML 1/3/5-minute snapshots when the session exits. */
+static void aml_debug_log_exit_summary(void) {
+  AML_DEBUG_SNAPSHOT snapshots[AML_DEBUG_MILESTONE_COUNT];
+
+  if (!aml_debug_enabled())
+    return;
+
+  pthread_mutex_lock(&amlDebugMutex);
+
+  memcpy(snapshots, amlDebugSnapshots, sizeof(snapshots));
+
+  pthread_mutex_unlock(&amlDebugMutex);
+
+  printf("AML debug milestone summary:\n");
+  aml_debug_print_snapshot("1m", &snapshots[0]);
+  aml_debug_print_snapshot("3m", &snapshots[1]);
+  aml_debug_print_snapshot("5m", &snapshots[2]);
+}
 
 /** Packs RGBA bytes into the active AML framebuffer channel layout. */
 static uint32_t aml_pack_fb_color(const struct fb_var_screeninfo* var, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
@@ -110,16 +445,23 @@ static void aml_clear_overlay(void) {
 
 /** Resets the FIFO of AML submit timestamps used to estimate hardware decode latency. */
 static void aml_reset_decode_submit_times(void) {
+  pthread_mutex_lock(&pendingDecodeSubmitMutex);
+
   pendingDecodeSubmitHead = 0;
   pendingDecodeSubmitCount = 0;
+
+  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
 }
 
 /** Queues the submit timestamp for a compressed frame entering the AML decoder pipeline. */
 static void aml_push_decode_submit_time(uint64_t submit_time_us) {
   unsigned int index;
+  unsigned int queue_depth;
 
   if (submit_time_us == 0)
     return;
+
+  pthread_mutex_lock(&pendingDecodeSubmitMutex);
 
   if (pendingDecodeSubmitCount == (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]))) {
     pendingDecodeSubmitHead = (pendingDecodeSubmitHead + 1) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
@@ -130,17 +472,29 @@ static void aml_push_decode_submit_time(uint64_t submit_time_us) {
   index = (pendingDecodeSubmitHead + pendingDecodeSubmitCount) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
   pendingDecodeSubmitTimesUs[index] = submit_time_us;
   pendingDecodeSubmitCount++;
+  queue_depth = pendingDecodeSubmitCount;
+
+  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+  aml_debug_note_submit_depth(queue_depth);
 }
 
 /** Pops the oldest submit timestamp once the AML pipeline finishes a frame. */
 static bool aml_pop_decode_submit_time(uint64_t* submit_time_us) {
-  if (pendingDecodeSubmitCount == 0)
-    return false;
+  bool have_sample;
 
-  *submit_time_us = pendingDecodeSubmitTimesUs[pendingDecodeSubmitHead];
-  pendingDecodeSubmitHead = (pendingDecodeSubmitHead + 1) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
-  pendingDecodeSubmitCount--;
-  return true;
+  pthread_mutex_lock(&pendingDecodeSubmitMutex);
+
+  if (pendingDecodeSubmitCount == 0)
+    have_sample = false;
+  else {
+    *submit_time_us = pendingDecodeSubmitTimesUs[pendingDecodeSubmitHead];
+    pendingDecodeSubmitHead = (pendingDecodeSubmitHead + 1) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
+    pendingDecodeSubmitCount--;
+    have_sample = true;
+  }
+
+  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+  return have_sample;
 }
 
 /** Returns the number of vertically stacked framebuffer pages exposed by the AML OSD plane. */
@@ -258,6 +612,33 @@ static void aml_overlay_render(void) {
   }
 }
 
+/** Waits for an AML decoded frame to become available without busy-spinning on VIDIOC_DQBUF. */
+static bool aml_wait_for_frame_ready(void) {
+  struct pollfd pfd = { 0 };
+
+  pfd.fd = videoFd;
+  pfd.events = POLLIN | POLLPRI;
+
+  while (!done) {
+    int ret = poll(&pfd, 1, AML_DQBUF_POLL_TIMEOUT_MS);
+
+    if (ret > 0)
+      return true;
+    if (ret == 0) {
+      if (aml_debug_enabled())
+        aml_debug_note_dqbuf_poll_timeout();
+      continue;
+    }
+    if (errno == EINTR)
+      continue;
+
+    fprintf(stderr, "poll() on AML video device failed: %d\n", errno);
+    return false;
+  }
+
+  return false;
+}
+
 /** Drains AML display buffers and refreshes the OSD overlay once per presented frame. */
 void* aml_display_thread(void* unused) {
   while (!done) {
@@ -265,11 +646,16 @@ void* aml_display_thread(void* unused) {
     uint64_t frame_completed_us;
     uint64_t render_completed_us;
     uint64_t submit_started_us = 0;
+    int video_delay_ms = -1;
     vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    if (!aml_wait_for_frame_ready())
+      break;
 
     if (ioctl(videoFd, VIDIOC_DQBUF, &vbuf) < 0) {
       if (errno == EAGAIN) {
-        usleep(500);
+        if (aml_debug_enabled())
+          aml_debug_note_dqbuf_poll_timeout();
         continue;
       }
       fprintf(stderr, "VIDIOC_DQBUF failed: %d\n", errno);
@@ -278,14 +664,26 @@ void* aml_display_thread(void* unused) {
 
     // A dequeued AML capture buffer corresponds to a frame that has completed the hardware decode/display pipeline.
     frame_completed_us = LiGetMicroseconds();
-    if (overlayEnabled) {
-      if (aml_pop_decode_submit_time(&submit_started_us) && frame_completed_us >= submit_started_us) {
-        // Amlogic does not expose per-frame decoder work time, so estimate it as submit-to-output pipeline time.
-        // This includes hardware decode plus decoder-side buffering, which is a better latency proxy than codec_write() cost.
-        stats_overlay_runtime_note_decoded_frame((frame_completed_us - submit_started_us) / 1000.0);
-      } else {
-        stats_overlay_runtime_note_decoded_output();
+    if (aml_pop_decode_submit_time(&submit_started_us) && frame_completed_us >= submit_started_us) {
+      double decode_latency_ms = (frame_completed_us - submit_started_us) / 1000.0;
+
+      if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
+          amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) != 0) {
+        video_delay_ms = -1;
       }
+
+      // Amlogic does not expose per-frame decoder work time, so estimate it as submit-to-output pipeline time.
+      // This includes hardware decode plus decoder-side buffering, which is a better latency proxy than codec_write() cost.
+      if (overlayEnabled)
+        stats_overlay_runtime_note_decoded_frame(decode_latency_ms);
+      if (aml_debug_enabled())
+        aml_debug_note_frame(decode_latency_ms, video_delay_ms);
+    } else if (overlayEnabled) {
+      stats_overlay_runtime_note_decoded_output();
+    } else if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
+               amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0 &&
+               aml_debug_enabled()) {
+      aml_debug_note_frame(0.0, video_delay_ms);
     }
 
     if (ioctl(videoFd, VIDIOC_QBUF, &vbuf) < 0) {
@@ -317,6 +715,8 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.stream_type        = STREAM_TYPE_ES_VIDEO;
   codecParam.am_sysinfo.param   = 0;
   done = false;
+  amlTargetDelayMs = aml_target_delay_ms(redrawRate);
+  aml_optional_apis_init();
   aml_reset_decode_submit_times();
   overlayWarningEmitted = false;
   overlayEnabled = stats_pref != NULL && stats_pref->enabled;
@@ -388,6 +788,8 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
     fprintf(stderr, "Can't set Freerun mode: %x\n", ret);
     return -2;
   }
+  aml_apply_latency_controls();
+  aml_debug_log_setup_state();
 
   char vfm_map[2048] = {};
   char* eol;
@@ -422,8 +824,11 @@ void aml_cleanup() {
     close(videoFd);
   }
 
+  aml_debug_log_exit_summary();
   codec_close(&codecParam);
   free(pkt_buf);
+  pkt_buf = NULL;
+  pkt_buf_size = 0;
   aml_reset_decode_submit_times();
   aml_overlay_destroy();
   stats_overlay_runtime_stop();
@@ -431,7 +836,11 @@ void aml_cleanup() {
 
 /** Submits a decode unit to AML and records the live overlay timing samples. */
 int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
+  uint64_t write_started_us;
   uint64_t submit_started_us;
+  uint64_t write_completed_us;
+  uint64_t stalled_us = 0;
+  unsigned int eagain_count = 0;
 
   ensure_buf_size(&pkt_buf, &pkt_buf_size, decodeUnit->fullLength);
   if (overlayEnabled)
@@ -449,6 +858,7 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   // presentationTimeUs is in microseconds; amcodec expects milliseconds.
   codec_checkin_pts(&codecParam, decodeUnit->presentationTimeUs / 1000);
   submit_started_us = LiGetMicroseconds();
+  write_started_us = submit_started_us;
   while (length > 0) {
     api = codec_write(&codecParam, pkt_buf+written, length);
     if (api < 0) {
@@ -457,20 +867,28 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
         codec_reset(&codecParam);
         break;
       } else {
+        uint64_t stall_started_us = LiGetMicroseconds();
+
         if (++errCounter == MAX_WRITE_ATTEMPTS) {
           fprintf(stderr, "codec_write() timeout\n");
           break;
         }
+        eagain_count++;
         usleep(EAGAIN_SLEEP_TIME);
+        stalled_us += LiGetMicroseconds() - stall_started_us;
       }
     } else {
       written += api;
       length -= api;
     }
   }
+  write_completed_us = LiGetMicroseconds();
 
-  if (overlayEnabled && length == 0) {
-    // Record the time when the compressed frame finished entering amcodec so the display thread can estimate pipeline latency.
+  if (aml_debug_enabled())
+    aml_debug_note_codec_write(write_completed_us - write_started_us, stalled_us, eagain_count);
+
+  if ((overlayEnabled || aml_debug_enabled()) && length == 0) {
+    // Record the submit start time so the display thread can estimate AML pipeline latency even when the overlay is disabled.
     aml_push_decode_submit_time(submit_started_us);
   }
 
