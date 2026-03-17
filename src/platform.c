@@ -427,8 +427,8 @@ void platform_get_overlay_capability(enum platform system, PSTATS_OVERLAY_CAPABI
 int platform_get_client_refresh_rate_x100(enum platform system) {
   switch (system) {
   case AML:
-    // AML mode strings like 1080p60hz are not precise enough to infer a safe pacing override.
-    return 0;
+    // The AML detector combines the mode string with frac_rate_policy, so it can distinguish true 59.94 Hz output from nominal 60 Hz labels.
+    return platform_aml_detect_refresh_rate_x100();
   default:
     return 0;
   }

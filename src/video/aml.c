@@ -36,6 +36,7 @@
 #include <sys/mman.h>
 #include <poll.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #include <linux/videodev2.h>
 #include <linux/fb.h>
@@ -58,12 +59,17 @@
 #define AML_LOW_LATENCY_RESYNC_ARM_US (250ULL * 1000ULL)
 #define AML_RESYNC_STARTUP_GRACE_US (5ULL * 1000ULL * 1000ULL)
 #define AML_RESYNC_COOLDOWN_US (1000ULL * 1000ULL)
+#define AML_STEADY_STATE_PENDING_FRAMES 1
+#define AML_STARTUP_PENDING_FRAMES 2
+#define AML_SUBMIT_THROTTLE_TIMEOUT_FRAMES 2ULL
+#define AML_DEFAULT_FRAME_DURATION_US 16667ULL
 
 static codec_para_t codecParam = { 0 };
 static pthread_t displayThread;
 static int videoFd = -1;
 static volatile bool done = false;
 static pthread_mutex_t pendingDecodeSubmitMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pendingDecodeSubmitCond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t amlDebugMutex = PTHREAD_MUTEX_INITIALIZER;
 static int overlayFd = -1;
 static uint32_t* overlayPixels = NULL;
@@ -88,7 +94,10 @@ static bool amlAwaitingIdr = false;
 static double amlLatestDecodeLatencyMs = 0.0;
 static int amlConfiguredRateX100 = 0;
 static unsigned int amlConfiguredFrameDurationTicks = 0;
+static uint64_t amlConfiguredFrameDurationUs = AML_DEFAULT_FRAME_DURATION_US;
 static int amlFracRatePolicy = -1;
+static bool amlDisplayTrackingEnabled = false;
+static bool amlPlaybackStarted = false;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -604,12 +613,63 @@ static void aml_clear_overlay(void) {
     memset(overlayPixels, 0, overlayMapSize);
 }
 
+/** Returns how long AML submit throttling should wait before falling back to the existing backlog recovery path. */
+static uint64_t aml_submit_throttle_timeout_us(void) {
+  return amlConfiguredFrameDurationUs != 0 ?
+      amlConfiguredFrameDurationUs * AML_SUBMIT_THROTTLE_TIMEOUT_FRAMES :
+      AML_DEFAULT_FRAME_DURATION_US * AML_SUBMIT_THROTTLE_TIMEOUT_FRAMES;
+}
+
 /** Resets the FIFO of AML submit timestamps used to estimate hardware decode latency. */
 static void aml_reset_decode_submit_times(void) {
   pthread_mutex_lock(&pendingDecodeSubmitMutex);
 
   pendingDecodeSubmitHead = 0;
   pendingDecodeSubmitCount = 0;
+  amlPlaybackStarted = false;
+  pthread_cond_broadcast(&pendingDecodeSubmitCond);
+
+  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+}
+
+/** Marks AML playback as active once the display path starts draining frames. */
+static void aml_mark_playback_started(void) {
+  pthread_mutex_lock(&pendingDecodeSubmitMutex);
+
+  amlPlaybackStarted = true;
+  pthread_cond_broadcast(&pendingDecodeSubmitCond);
+
+  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+}
+
+/** Waits briefly for AML to drain back to the desired low-latency queue depth before submitting another frame. */
+static void aml_wait_for_submit_capacity(void) {
+  struct timespec deadline;
+  uint64_t wait_timeout_us;
+
+  if (!amlDisplayTrackingEnabled)
+    return;
+
+  wait_timeout_us = aml_submit_throttle_timeout_us();
+  if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+    return;
+
+  deadline.tv_sec += (time_t) (wait_timeout_us / 1000000ULL);
+  deadline.tv_nsec += (long) ((wait_timeout_us % 1000000ULL) * 1000ULL);
+  if (deadline.tv_nsec >= 1000000000L) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+
+  pthread_mutex_lock(&pendingDecodeSubmitMutex);
+
+  // Allow a short two-frame startup pre-roll, then hold AML at one submitted frame in steady state.
+  while (!done &&
+         amlDisplayTrackingEnabled &&
+         pendingDecodeSubmitCount >= (amlPlaybackStarted ? AML_STEADY_STATE_PENDING_FRAMES : AML_STARTUP_PENDING_FRAMES)) {
+    if (pthread_cond_timedwait(&pendingDecodeSubmitCond, &pendingDecodeSubmitMutex, &deadline) == ETIMEDOUT)
+      break;
+  }
 
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
 }
@@ -652,6 +712,7 @@ static bool aml_pop_decode_submit_time(uint64_t* submit_time_us) {
     pendingDecodeSubmitHead = (pendingDecodeSubmitHead + 1) % (sizeof(pendingDecodeSubmitTimesUs) / sizeof(pendingDecodeSubmitTimesUs[0]));
     pendingDecodeSubmitCount--;
     have_sample = true;
+    pthread_cond_broadcast(&pendingDecodeSubmitCond);
   }
 
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
@@ -686,6 +747,9 @@ static double aml_latest_decode_latency_ms(void) {
 static bool aml_should_request_resync(unsigned int pending_depth) {
   double latest_latency_ms;
   uint64_t now_us;
+
+  if (!amlDisplayTrackingEnabled)
+    return false;
 
   if (pending_depth < AML_LOW_LATENCY_PENDING_FRAMES) {
     amlLowLatencyResyncEligibleSinceUs = 0;
@@ -906,6 +970,7 @@ void* aml_display_thread(void* unused) {
 
     // A dequeued AML capture buffer corresponds to a frame that has completed the hardware decode/display pipeline.
     frame_completed_us = LiGetMicroseconds();
+    aml_mark_playback_started();
     if (aml_pop_decode_submit_time(&submit_started_us) && frame_completed_us >= submit_started_us) {
       double decode_latency_ms = (frame_completed_us - submit_started_us) / 1000.0;
 
@@ -958,6 +1023,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.stream_type        = STREAM_TYPE_ES_VIDEO;
   codecParam.am_sysinfo.param   = 0;
   done = false;
+  videoFd = -1;
   amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
   amlLastResyncRequestUs = 0;
   amlLowLatencyResyncEligibleSinceUs = 0;
@@ -965,7 +1031,10 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlLatestDecodeLatencyMs = 0.0;
   amlConfiguredRateX100 = redrawRate * 100;
   amlConfiguredFrameDurationTicks = 0;
+  amlConfiguredFrameDurationUs = redrawRate > 0 ? (1000000ULL / (uint64_t) redrawRate) : AML_DEFAULT_FRAME_DURATION_US;
   amlFracRatePolicy = -1;
+  amlDisplayTrackingEnabled = false;
+  amlPlaybackStarted = false;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   aml_optional_apis_init();
   aml_reset_decode_submit_times();
@@ -1016,6 +1085,9 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   codecParam.am_sysinfo.height = height;
   codecParam.am_sysinfo.rate = aml_frame_duration_ticks(redrawRate);
   amlConfiguredFrameDurationTicks = codecParam.am_sysinfo.rate;
+  amlConfiguredFrameDurationUs = amlConfiguredRateX100 > 0 ?
+      (100000000ULL + (uint64_t) (amlConfiguredRateX100 / 2)) / (uint64_t) amlConfiguredRateX100 :
+      (redrawRate > 0 ? (1000000ULL / (uint64_t) redrawRate) : AML_DEFAULT_FRAME_DURATION_US);
   codecParam.am_sysinfo.param = (void*) ((size_t) codecParam.am_sysinfo.param | SYNC_OUTSIDE);
 
   if (overlayEnabled) {
@@ -1059,6 +1131,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
         return -3;
       }
 
+      amlDisplayTrackingEnabled = true;
       pthread_create(&displayThread, NULL, aml_display_thread, NULL);
     }
   }
@@ -1072,8 +1145,13 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
 void aml_cleanup() {
   if (videoFd >= 0) {
     done = true;
+    pthread_mutex_lock(&pendingDecodeSubmitMutex);
+    amlDisplayTrackingEnabled = false;
+    pthread_cond_broadcast(&pendingDecodeSubmitCond);
+    pthread_mutex_unlock(&pendingDecodeSubmitMutex);
     pthread_join(displayThread, NULL);
     close(videoFd);
+    videoFd = -1;
   }
 
   aml_debug_log_exit_summary();
@@ -1122,6 +1200,7 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
 
   if (overlayEnabled)
     stats_overlay_runtime_note_decode_unit(decodeUnit);
+  aml_wait_for_submit_capacity();
 
   int written = 0, length = 0, errCounter = 0, api;
   PLENTRY entry = decodeUnit->bufferList;
@@ -1163,7 +1242,7 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   if (aml_debug_enabled())
     aml_debug_note_codec_write(write_completed_us - write_started_us, stalled_us, eagain_count);
 
-  if ((overlayEnabled || aml_debug_enabled()) && length == 0) {
+  if (amlDisplayTrackingEnabled && length == 0) {
     // Record the submit start time so the display thread can estimate AML pipeline latency even when the overlay is disabled.
     aml_push_decode_submit_time(submit_started_us);
   }
