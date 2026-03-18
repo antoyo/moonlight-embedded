@@ -451,6 +451,15 @@ static void aml_debug_note_dqbuf_poll_timeout(void) {
   pthread_mutex_unlock(&amlDebugMutex);
 }
 
+/** Stores the latest AML submit-to-output latency sample so recovery logic works even when debug logging is off. */
+static void aml_record_decode_latency_sample(double decode_latency_ms) {
+  pthread_mutex_lock(&amlDebugMutex);
+
+  amlLatestDecodeLatencyMs = decode_latency_ms;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
 /** Records AML pipeline-latency samples and emits a once-per-second summary when debug is active. */
 static void aml_debug_note_frame(double decode_latency_ms, int video_delay_ms) {
   uint64_t now_us = LiGetMicroseconds();
@@ -464,7 +473,6 @@ static void aml_debug_note_frame(double decode_latency_ms, int video_delay_ms) {
   amlDebugMetrics.decode_latency_total_ms += decode_latency_ms;
   if (decode_latency_ms > amlDebugMetrics.decode_latency_max_ms)
     amlDebugMetrics.decode_latency_max_ms = decode_latency_ms;
-  amlLatestDecodeLatencyMs = decode_latency_ms;
 
   if (video_delay_ms >= 0) {
     amlDebugMetrics.video_delay_total_ms += video_delay_ms;
@@ -637,6 +645,12 @@ static void aml_reset_decode_submit_times(void) {
   pthread_cond_broadcast(&pendingDecodeSubmitCond);
 
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+
+  pthread_mutex_lock(&amlDebugMutex);
+
+  amlLatestDecodeLatencyMs = 0.0;
+
+  pthread_mutex_unlock(&amlDebugMutex);
 }
 
 /** Marks AML playback as active once the display path starts draining frames. */
@@ -982,6 +996,9 @@ void* aml_display_thread(void* unused) {
     aml_mark_playback_started();
     if (aml_pop_decode_submit_time(&submit_started_us) && frame_completed_us >= submit_started_us) {
       double decode_latency_ms = (frame_completed_us - submit_started_us) / 1000.0;
+
+      // Keep low-latency recovery armed from live pipeline samples regardless of whether verbose logging is enabled.
+      aml_record_decode_latency_sample(decode_latency_ms);
 
       if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
           amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) != 0) {
