@@ -18,6 +18,8 @@ int main(void) {
   stats_overlay_snapshot_set_stream(&snapshot, 1920, 1080, 60.0, "HEVC");
   stats_overlay_snapshot_set_value(&snapshot.decoding_fps, true, 59.5);
   stats_overlay_snapshot_set_value(&snapshot.rendering_fps, true, 60.0);
+  stats_overlay_snapshot_set_value(&snapshot.skipped_fps, true, 2.0);
+  stats_overlay_snapshot_set_value(&snapshot.skipped_frames_total, true, 7.0);
   stats_overlay_init(&state);
   stats_overlay_session_start(&state, &pref, &capability);
 
@@ -28,13 +30,16 @@ int main(void) {
   assert(strstr(state.formatted_lines[1], "Unavailable") != NULL);
   assert(strstr(state.formatted_lines[2], "59.50") != NULL);
   assert(strstr(state.formatted_lines[3], "60.00") != NULL);
+  assert(strstr(state.formatted_lines[4], "2.00 FPS") != NULL);
+  assert(strstr(state.formatted_lines[4], "7 total") != NULL);
   assert(stats_overlay_measure_width(&state) > 0);
   assert(stats_overlay_measure_height(&state) == STATS_OVERLAY_MAX_LINES * STATS_OVERLAY_FONT_HEIGHT);
-  assert(strstr(state.formatted_lines[10], "Unavailable") != NULL);
+  assert(strstr(state.formatted_lines[11], "Unavailable") != NULL);
   assert(strcmp(state.formatted_lines[0], "Video stream: 1920x1080 60.00 FPS (Codec: HEVC)") == 0);
   assert(strcmp(state.formatted_lines[1], "Incoming frame rate from network: Unavailable") == 0);
   assert(strcmp(state.formatted_lines[2], "Decoding frame rate: 59.50") == 0);
   assert(strcmp(state.formatted_lines[3], "Rendering frame rate: 60.00") == 0);
+  assert(strcmp(state.formatted_lines[4], "Skipped frames during decoder recovery: 2.00 FPS (7 total)") == 0);
 
   assert(stats_overlay_update(&state, &snapshot, 1200) == false);
   assert(stats_overlay_update(&state, &snapshot, 1600) == true);

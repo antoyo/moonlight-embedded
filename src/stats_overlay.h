@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define STATS_OVERLAY_MAX_LINES 11
+#define STATS_OVERLAY_MAX_LINES 12
 #define STATS_OVERLAY_MAX_LINE_LENGTH 192
 
 enum stats_overlay_option_source {
@@ -36,6 +36,8 @@ typedef struct _STATS_OVERLAY_SNAPSHOT {
   STATS_OVERLAY_VALUE incoming_network_fps;
   STATS_OVERLAY_VALUE decoding_fps;
   STATS_OVERLAY_VALUE rendering_fps;
+  STATS_OVERLAY_VALUE skipped_fps;
+  STATS_OVERLAY_VALUE skipped_frames_total;
   STATS_OVERLAY_VALUE host_latency_min_ms;
   STATS_OVERLAY_VALUE host_latency_max_ms;
   STATS_OVERLAY_VALUE host_latency_avg_ms;
@@ -91,6 +93,7 @@ void stats_overlay_draw_argb32(uint32_t* pixels, size_t stride_pixels, int width
 void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const PSTATS_OVERLAY_CAPABILITY capability, int width, int height, double fps, const char* codec);
 void stats_overlay_runtime_stop(void);
 void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit);
+void stats_overlay_runtime_note_skipped_frame(void);
 void stats_overlay_runtime_note_decoded_output(void);
 void stats_overlay_runtime_note_decoded_frame(double decode_time_ms);
 void stats_overlay_runtime_note_render(double render_time_ms, uint64_t render_completed_us);

@@ -1202,6 +1202,8 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   ensure_buf_size(&pkt_buf, &pkt_buf_size, decodeUnit->fullLength);
 
   if (aml_should_drop_for_resync(decodeUnit)) {
+    if (overlayEnabled)
+      stats_overlay_runtime_note_skipped_frame();
     if (aml_debug_enabled())
       printf("AML debug: dropping non-IDR frame while waiting for backlog recovery IDR\n");
     return DR_OK;

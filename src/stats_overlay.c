@@ -10,6 +10,8 @@ typedef struct _STATS_OVERLAY_WINDOW {
   unsigned int incoming_frames;
   unsigned int decoded_frames;
   unsigned int rendered_frames;
+  unsigned int skipped_frames;
+  uint64_t skipped_frames_total;
   uint64_t last_presentation_time_us;
   double stream_frame_interval_total_us;
   unsigned int stream_frame_interval_count;
@@ -45,10 +47,13 @@ static uint64_t stats_overlay_now_ms(void) {
 
 /** Resets the rolling metric window used for overlay refresh calculations. */
 static void stats_overlay_window_reset(PSTATS_OVERLAY_WINDOW window, uint64_t now_ms) {
+  uint64_t skipped_frames_total = window->skipped_frames_total;
+
   memset(window, 0, sizeof(*window));
   window->started_at_ms = now_ms;
   window->host_latency_min_ms = 0.0;
   window->host_latency_max_ms = 0.0;
+  window->skipped_frames_total = skipped_frames_total;
 }
 
 /** Queues a frame-enqueue timestamp so the eventual present path can measure queue delay. */
@@ -90,6 +95,16 @@ static void format_value(char* buffer, size_t buffer_size, const PSTATS_OVERLAY_
     snprintf(buffer, buffer_size, "%.2f%s", value->value, suffix);
   else
     snprintf(buffer, buffer_size, "%.2f", value->value);
+}
+
+/** Formats an integer-style counter value without fractional digits. */
+static void format_count_value(char* buffer, size_t buffer_size, const PSTATS_OVERLAY_VALUE value) {
+  if (!value->available) {
+    snprintf(buffer, buffer_size, "Unavailable");
+    return;
+  }
+
+  snprintf(buffer, buffer_size, "%.0f", value->value);
 }
 
 /** Initializes the session preference with the default disabled state. */
@@ -204,29 +219,33 @@ bool stats_overlay_update(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLAY_SNAPS
   format_value(buffer_a, sizeof(buffer_a), &snapshot->rendering_fps, "");
   snprintf(state->formatted_lines[3], sizeof(state->formatted_lines[3]), "Rendering frame rate: %s", buffer_a);
 
+  format_value(buffer_a, sizeof(buffer_a), &snapshot->skipped_fps, "");
+  format_count_value(buffer_b, sizeof(buffer_b), &snapshot->skipped_frames_total);
+  snprintf(state->formatted_lines[4], sizeof(state->formatted_lines[4]), "Skipped frames during decoder recovery: %s FPS (%s total)", buffer_a, buffer_b);
+
   format_value(buffer_a, sizeof(buffer_a), &snapshot->host_latency_min_ms, " ms");
   format_value(buffer_b, sizeof(buffer_b), &snapshot->host_latency_max_ms, " ms");
   format_value(buffer_c, sizeof(buffer_c), &snapshot->host_latency_avg_ms, " ms");
-  snprintf(state->formatted_lines[4], sizeof(state->formatted_lines[4]), "Host processing latency min/max/average: %s/%s/%s", buffer_a, buffer_b, buffer_c);
+  snprintf(state->formatted_lines[5], sizeof(state->formatted_lines[5]), "Host processing latency min/max/average: %s/%s/%s", buffer_a, buffer_b, buffer_c);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->network_drop_pct, "%");
-  snprintf(state->formatted_lines[5], sizeof(state->formatted_lines[5]), "Frames dropped by your network connection: %s", buffer_a);
+  snprintf(state->formatted_lines[6], sizeof(state->formatted_lines[6]), "Frames dropped by your network connection: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->jitter_drop_pct, "%");
-  snprintf(state->formatted_lines[6], sizeof(state->formatted_lines[6]), "Frames dropped due to network jitter: %s", buffer_a);
+  snprintf(state->formatted_lines[7], sizeof(state->formatted_lines[7]), "Frames dropped due to network jitter: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->network_latency_avg_ms, " ms");
   format_value(buffer_b, sizeof(buffer_b), &snapshot->network_latency_variance_ms, " ms");
-  snprintf(state->formatted_lines[7], sizeof(state->formatted_lines[7]), "Average network latency: %s (variance: %s)", buffer_a, buffer_b);
+  snprintf(state->formatted_lines[8], sizeof(state->formatted_lines[8]), "Average network latency: %s (variance: %s)", buffer_a, buffer_b);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->decode_time_avg_ms, " ms");
-  snprintf(state->formatted_lines[8], sizeof(state->formatted_lines[8]), "Average decoding time: %s", buffer_a);
+  snprintf(state->formatted_lines[9], sizeof(state->formatted_lines[9]), "Average decoding time: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->queue_delay_avg_ms, " ms");
-  snprintf(state->formatted_lines[9], sizeof(state->formatted_lines[9]), "Average queue delay: %s", buffer_a);
+  snprintf(state->formatted_lines[10], sizeof(state->formatted_lines[10]), "Average queue delay: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->render_time_avg_ms, " ms");
-  snprintf(state->formatted_lines[10], sizeof(state->formatted_lines[10]), "Average rendering time (including monitor V-sync latency): %s", buffer_a);
+  snprintf(state->formatted_lines[11], sizeof(state->formatted_lines[11]), "Average rendering time (including monitor V-sync latency): %s", buffer_a);
 
   state->line_count = STATS_OVERLAY_MAX_LINES;
   state->last_format_ms = now_ms;
@@ -295,6 +314,16 @@ void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit) {
     stats_overlay_runtime_window.host_latency_total_ms += host_latency_ms;
     stats_overlay_runtime_window.host_latency_count++;
   }
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Records a frame intentionally skipped while AML waits for a recovery IDR. */
+void stats_overlay_runtime_note_skipped_frame(void) {
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  stats_overlay_runtime_window.skipped_frames++;
+  stats_overlay_runtime_window.skipped_frames_total++;
 
   pthread_mutex_unlock(&stats_overlay_runtime_mutex);
 }
@@ -368,6 +397,10 @@ bool stats_overlay_runtime_refresh(void) {
           stats_overlay_runtime_window.decoded_frames / elapsed_seconds);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.rendering_fps, true,
           stats_overlay_runtime_window.rendered_frames / elapsed_seconds);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.skipped_fps, true,
+          stats_overlay_runtime_window.skipped_frames / elapsed_seconds);
+      stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.skipped_frames_total, true,
+          stats_overlay_runtime_window.skipped_frames_total);
       // Keep the first-line FPS dynamic by reflecting the measured incoming stream rate instead of the configured target FPS.
       stats_overlay_runtime_snapshot.video_fps = live_incoming_fps;
     }
