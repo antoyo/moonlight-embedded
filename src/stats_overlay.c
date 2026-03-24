@@ -121,6 +121,30 @@ static double stats_overlay_frame_period_ms(const PSTATS_OVERLAY_SNAPSHOT snapsh
   return 1000.0 / fps;
 }
 
+/** Formats the modeled end-to-end latency components on a single explanatory line. */
+static void stats_overlay_format_estimated_components(char* buffer, size_t buffer_size, const PSTATS_OVERLAY_SNAPSHOT snapshot) {
+  double frame_period_ms = stats_overlay_frame_period_ms(snapshot);
+
+  if (!snapshot->host_latency_avg_ms.available ||
+      !snapshot->network_latency_avg_ms.available ||
+      !snapshot->frame_assembly_delay_avg_ms.available ||
+      !snapshot->queue_delay_avg_ms.available ||
+      frame_period_ms <= 0.0) {
+    snprintf(buffer, buffer_size, "Estimated latency components: Unavailable");
+    return;
+  }
+
+  // Keep the text aligned with the modeled total formula so users can see the exact contribution of each term.
+  snprintf(buffer, buffer_size,
+      "Estimated latency components: host %.2f + down %.2f + assembly %.2f + queue %.2f + up %.2f + pacing %.2f ms",
+      snapshot->host_latency_avg_ms.value,
+      snapshot->network_latency_avg_ms.value,
+      snapshot->frame_assembly_delay_avg_ms.value,
+      snapshot->queue_delay_avg_ms.value,
+      snapshot->network_latency_avg_ms.value,
+      2.0 * frame_period_ms);
+}
+
 /** Updates the derived latency totals that combine measured and modeled stages. */
 static void stats_overlay_snapshot_update_latency_totals(PSTATS_OVERLAY_SNAPSHOT snapshot) {
   double frame_period_ms = stats_overlay_frame_period_ms(snapshot);
@@ -288,17 +312,19 @@ bool stats_overlay_update(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLAY_SNAPS
   format_value(buffer_a, sizeof(buffer_a), &snapshot->estimated_end_to_end_latency_avg_ms, " ms");
   snprintf(state->formatted_lines[11], sizeof(state->formatted_lines[11]), "Estimated end-to-end latency (modeled): %s", buffer_a);
 
+  stats_overlay_format_estimated_components(state->formatted_lines[12], sizeof(state->formatted_lines[12]), snapshot);
+
   format_value(buffer_a, sizeof(buffer_a), &snapshot->decoder_backlog_latency_avg_ms, " ms");
-  snprintf(state->formatted_lines[12], sizeof(state->formatted_lines[12]), "Decoder backlog latency: %s", buffer_a);
+  snprintf(state->formatted_lines[13], sizeof(state->formatted_lines[13]), "Decoder backlog latency: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->decode_time_avg_ms, " ms");
-  snprintf(state->formatted_lines[13], sizeof(state->formatted_lines[13]), "Average decoding time: %s", buffer_a);
+  snprintf(state->formatted_lines[14], sizeof(state->formatted_lines[14]), "Average decoding time: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->queue_delay_avg_ms, " ms");
-  snprintf(state->formatted_lines[14], sizeof(state->formatted_lines[14]), "Average queue delay: %s", buffer_a);
+  snprintf(state->formatted_lines[15], sizeof(state->formatted_lines[15]), "Average queue delay: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->render_time_avg_ms, " ms");
-  snprintf(state->formatted_lines[15], sizeof(state->formatted_lines[15]), "Average rendering time (including monitor V-sync latency): %s", buffer_a);
+  snprintf(state->formatted_lines[16], sizeof(state->formatted_lines[16]), "Average rendering time (including monitor V-sync latency): %s", buffer_a);
 
   state->line_count = STATS_OVERLAY_MAX_LINES;
   state->last_format_ms = now_ms;

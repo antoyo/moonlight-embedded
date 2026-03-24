@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define STATS_OVERLAY_MAX_LINES 16
+#define STATS_OVERLAY_MAX_LINES 17
 #define STATS_OVERLAY_MAX_LINE_LENGTH 192
 
 enum stats_overlay_option_source {

@@ -40,6 +40,7 @@ Average network latency: <avg> (variance: <value>)
 Average frame assembly delay: <value>
 Observed stream-to-display latency: <value>
 Estimated end-to-end latency (modeled): <value>
+Estimated latency components: <value>
 Decoder backlog latency: <value>
 Average decoding time: <value>
 Average queue delay: <value>

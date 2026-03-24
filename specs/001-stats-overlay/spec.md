@@ -26,7 +26,7 @@ A user who wants immediate visibility into stream quality enables stats output b
 **Acceptance Scenarios**:
 
 1. **Given** stats output is enabled for the session, **When** the user starts streaming and video becomes visible, **Then** a stats panel appears in the top-left corner within 5 seconds.
-2. **Given** stats output is enabled and all expected telemetry is available, **When** the panel is shown, **Then** it displays labeled values for stream resolution, stream frame rate, codec, incoming network frame rate, decoding frame rate, rendering frame rate, skipped-frame recovery rate, host processing latency minimum/maximum/average, network drop rate, jitter drop rate, average network latency with variance, average frame assembly delay, observed stream-to-display latency, estimated end-to-end latency, decoder backlog latency when supported, average decoding time, average queue delay, and average rendering time.
+2. **Given** stats output is enabled and all expected telemetry is available, **When** the panel is shown, **Then** it displays labeled values for stream resolution, stream frame rate, codec, incoming network frame rate, decoding frame rate, rendering frame rate, skipped-frame recovery rate, host processing latency minimum/maximum/average, network drop rate, jitter drop rate, average network latency with variance, average frame assembly delay, observed stream-to-display latency, estimated end-to-end latency, a single-line breakdown of the estimated latency components, decoder backlog latency when supported, average decoding time, average queue delay, and average rendering time.
 3. **Given** stats output is enabled and a stream is active, **When** frame rate, bitrate, latency, or packet quality changes, **Then** the panel reflects the updated values within 2 seconds.
 4. **Given** stats output is enabled, **When** the streaming session ends, **Then** the stats panel disappears with the session output.
 5. **Given** a stream is already active, **When** the user changes the stats-overlay setting outside the current session, **Then** the current session's overlay state does not change and the new setting applies on the next session start.
@@ -93,6 +93,7 @@ A user with stats enabled still receives a stable overlay even when some metrics
   - average frame assembly delay between first-packet receipt and decoder enqueue
   - observed stream-to-display latency derived from non-overlapping measured stages
   - estimated end-to-end latency derived from measured stages plus modeled frame pacing assumptions
+  - a single-line breakdown of the estimated end-to-end latency components
   - decoder backlog latency when the active backend exposes it
   - average decoding time
   - average queue delay
@@ -123,6 +124,7 @@ Average network latency: 1 ms (variance: 1 ms)
 Average frame assembly delay: 0.75 ms
 Observed stream-to-display latency: 12.54 ms
 Estimated end-to-end latency (modeled): 46.87 ms
+Estimated latency components: host 2.60 + down 1.00 + assembly 0.75 + queue 8.19 + up 1.00 + pacing 33.33 ms
 Decoder backlog latency: 3.20 ms
 Average decoding time: 0.38 ms
 Average queue delay: 8.19 ms
