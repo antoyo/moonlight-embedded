@@ -28,11 +28,14 @@ The feature introduces a session-scoped preference, a live telemetry snapshot, a
 |-------|------|-------------|
 | `video_width` | integer | Active streamed width |
 | `video_height` | integer | Active streamed height |
+| `configured_video_fps` | decimal | Requested stream frame rate used as the fallback modeling cadence |
 | `video_fps` | decimal | Streamed frame rate |
 | `codec` | enum | Active codec label such as `H264`, `HEVC`, or `AV1` |
 | `incoming_network_fps` | decimal or unavailable | Frames per second arriving from the network |
 | `decoding_fps` | decimal or unavailable | Frames per second successfully decoded |
 | `rendering_fps` | decimal or unavailable | Frames per second presented to the display path |
+| `skipped_fps` | decimal or unavailable | Frames per second intentionally skipped during decoder recovery |
+| `skipped_frames_total` | decimal or unavailable | Total skipped frames for the current session |
 | `host_latency_min_ms` | decimal or unavailable | Minimum host processing latency |
 | `host_latency_max_ms` | decimal or unavailable | Maximum host processing latency |
 | `host_latency_avg_ms` | decimal or unavailable | Average host processing latency |
@@ -40,6 +43,10 @@ The feature introduces a session-scoped preference, a live telemetry snapshot, a
 | `jitter_drop_pct` | decimal or unavailable | Frames dropped because of network jitter |
 | `network_latency_avg_ms` | decimal or unavailable | Average network latency |
 | `network_latency_variance_ms` | decimal or unavailable | Network latency variance |
+| `frame_assembly_delay_avg_ms` | decimal or unavailable | Average client-side receive-to-enqueue delay before decoder submission |
+| `observed_stream_to_display_latency_avg_ms` | decimal or unavailable | Measured host-to-client display latency from non-overlapping stages |
+| `estimated_end_to_end_latency_avg_ms` | decimal or unavailable | Modeled end-to-end latency including uplink and pacing assumptions |
+| `decoder_backlog_latency_avg_ms` | decimal or unavailable | Backend-reported decoder/display backlog latency when supported |
 | `decode_time_avg_ms` | decimal or unavailable | Average decode time |
 | `queue_delay_avg_ms` | decimal or unavailable | Average queue delay before presentation |
 | `render_time_avg_ms` | decimal or unavailable | Average render time including display synchronization delay |

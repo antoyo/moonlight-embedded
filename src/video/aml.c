@@ -1005,6 +1005,9 @@ void* aml_display_thread(void* unused) {
         video_delay_ms = -1;
       }
 
+      if (overlayEnabled && video_delay_ms >= 0)
+        stats_overlay_runtime_note_decoder_backlog(video_delay_ms);
+
       // Amlogic does not expose per-frame decoder work time, so estimate it as submit-to-output pipeline time.
       // This includes hardware decode plus decoder-side buffering, which is a better latency proxy than codec_write() cost.
       if (overlayEnabled)
@@ -1012,6 +1015,10 @@ void* aml_display_thread(void* unused) {
       if (aml_debug_enabled())
         aml_debug_note_frame(decode_latency_ms, video_delay_ms);
     } else if (overlayEnabled) {
+      if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
+          amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0) {
+        stats_overlay_runtime_note_decoder_backlog(video_delay_ms);
+      }
       stats_overlay_runtime_note_decoded_output();
     } else if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
                amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0 &&

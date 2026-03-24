@@ -26,7 +26,7 @@ A user who wants immediate visibility into stream quality enables stats output b
 **Acceptance Scenarios**:
 
 1. **Given** stats output is enabled for the session, **When** the user starts streaming and video becomes visible, **Then** a stats panel appears in the top-left corner within 5 seconds.
-2. **Given** stats output is enabled and all expected telemetry is available, **When** the panel is shown, **Then** it displays labeled values for stream resolution, stream frame rate, codec, incoming network frame rate, decoding frame rate, rendering frame rate, host processing latency minimum/maximum/average, network drop rate, jitter drop rate, average network latency with variance, average decoding time, average queue delay, and average rendering time.
+2. **Given** stats output is enabled and all expected telemetry is available, **When** the panel is shown, **Then** it displays labeled values for stream resolution, stream frame rate, codec, incoming network frame rate, decoding frame rate, rendering frame rate, skipped-frame recovery rate, host processing latency minimum/maximum/average, network drop rate, jitter drop rate, average network latency with variance, average frame assembly delay, observed stream-to-display latency, estimated end-to-end latency, decoder backlog latency when supported, average decoding time, average queue delay, and average rendering time.
 3. **Given** stats output is enabled and a stream is active, **When** frame rate, bitrate, latency, or packet quality changes, **Then** the panel reflects the updated values within 2 seconds.
 4. **Given** stats output is enabled, **When** the streaming session ends, **Then** the stats panel disappears with the session output.
 5. **Given** a stream is already active, **When** the user changes the stats-overlay setting outside the current session, **Then** the current session's overlay state does not change and the new setting applies on the next session start.
@@ -85,10 +85,15 @@ A user with stats enabled still receives a stable overlay even when some metrics
   - incoming frame rate from the network
   - decoding frame rate
   - rendering frame rate
+  - skipped frames during decoder recovery
   - host processing latency minimum, maximum, and average
   - frames dropped by the network connection as a percentage
   - frames dropped due to network jitter as a percentage
   - average network latency and latency variance
+  - average frame assembly delay between first-packet receipt and decoder enqueue
+  - observed stream-to-display latency derived from non-overlapping measured stages
+  - estimated end-to-end latency derived from measured stages plus modeled frame pacing assumptions
+  - decoder backlog latency when the active backend exposes it
   - average decoding time
   - average queue delay
   - average rendering time, including display synchronization delay
@@ -110,10 +115,15 @@ Video stream: 2560x1440 60.00 FPS (Codec: HEVC)
 Incoming frame rate from network: 60.00 FPS
 Decoding frame rate: 60.00 FPS
 Rendering frame rate: 60.00 FPS
+Skipped frames during decoder recovery: 0.00 FPS (0 total)
 Host processing latency min/max/average: 2.5/4.3/2.6 ms
 Frames dropped by your network connection: 0.00%
 Frames dropped due to network jitter: 0.00%
 Average network latency: 1 ms (variance: 1 ms)
+Average frame assembly delay: 0.75 ms
+Observed stream-to-display latency: 12.54 ms
+Estimated end-to-end latency (modeled): 46.87 ms
+Decoder backlog latency: 3.20 ms
 Average decoding time: 0.38 ms
 Average queue delay: 8.19 ms
 Average rendering time (including monitor V-sync latency): 0.30 ms

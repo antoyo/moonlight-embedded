@@ -32,10 +32,15 @@ Video stream: <width>x<height> <fps> FPS (Codec: <codec>)
 Incoming frame rate from network: <value>
 Decoding frame rate: <value>
 Rendering frame rate: <value>
+Skipped frames during decoder recovery: <value>
 Host processing latency min/max/average: <min>/<max>/<avg>
 Frames dropped by your network connection: <value>
 Frames dropped due to network jitter: <value>
 Average network latency: <avg> (variance: <value>)
+Average frame assembly delay: <value>
+Observed stream-to-display latency: <value>
+Estimated end-to-end latency (modeled): <value>
+Decoder backlog latency: <value>
 Average decoding time: <value>
 Average queue delay: <value>
 Average rendering time (including monitor V-sync latency): <value>

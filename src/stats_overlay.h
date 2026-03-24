@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define STATS_OVERLAY_MAX_LINES 12
+#define STATS_OVERLAY_MAX_LINES 16
 #define STATS_OVERLAY_MAX_LINE_LENGTH 192
 
 enum stats_overlay_option_source {
@@ -30,6 +30,7 @@ typedef struct _STATS_OVERLAY_VALUE {
 typedef struct _STATS_OVERLAY_SNAPSHOT {
   int video_width;
   int video_height;
+  double configured_video_fps;
   double video_fps;
   char codec[16];
 
@@ -45,6 +46,10 @@ typedef struct _STATS_OVERLAY_SNAPSHOT {
   STATS_OVERLAY_VALUE jitter_drop_pct;
   STATS_OVERLAY_VALUE network_latency_avg_ms;
   STATS_OVERLAY_VALUE network_latency_variance_ms;
+  STATS_OVERLAY_VALUE frame_assembly_delay_avg_ms;
+  STATS_OVERLAY_VALUE observed_stream_to_display_latency_avg_ms;
+  STATS_OVERLAY_VALUE estimated_end_to_end_latency_avg_ms;
+  STATS_OVERLAY_VALUE decoder_backlog_latency_avg_ms;
   STATS_OVERLAY_VALUE decode_time_avg_ms;
   STATS_OVERLAY_VALUE queue_delay_avg_ms;
   STATS_OVERLAY_VALUE render_time_avg_ms;
@@ -94,6 +99,7 @@ void stats_overlay_runtime_configure(const PSTATS_OVERLAY_PREFERENCE pref, const
 void stats_overlay_runtime_stop(void);
 void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit);
 void stats_overlay_runtime_note_skipped_frame(void);
+void stats_overlay_runtime_note_decoder_backlog(double backlog_ms);
 void stats_overlay_runtime_note_decoded_output(void);
 void stats_overlay_runtime_note_decoded_frame(double decode_time_ms);
 void stats_overlay_runtime_note_render(double render_time_ms, uint64_t render_completed_us);

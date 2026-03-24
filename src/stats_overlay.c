@@ -15,11 +15,15 @@ typedef struct _STATS_OVERLAY_WINDOW {
   uint64_t last_presentation_time_us;
   double stream_frame_interval_total_us;
   unsigned int stream_frame_interval_count;
+  double frame_assembly_delay_total_ms;
+  unsigned int frame_assembly_delay_count;
   double decode_time_total_ms;
   unsigned int decode_time_count;
   double render_time_total_ms;
   double queue_delay_total_ms;
   unsigned int queue_delay_count;
+  double decoder_backlog_latency_total_ms;
+  unsigned int decoder_backlog_latency_count;
   double host_latency_total_ms;
   unsigned int host_latency_count;
   double host_latency_min_ms;
@@ -107,6 +111,42 @@ static void format_count_value(char* buffer, size_t buffer_size, const PSTATS_OV
   snprintf(buffer, buffer_size, "%.0f", value->value);
 }
 
+/** Returns the frame period used to model unmeasured pacing and scanout delay. */
+static double stats_overlay_frame_period_ms(const PSTATS_OVERLAY_SNAPSHOT snapshot) {
+  double fps = snapshot->video_fps > 0.0 ? snapshot->video_fps : snapshot->configured_video_fps;
+
+  if (fps <= 0.0)
+    return 0.0;
+
+  return 1000.0 / fps;
+}
+
+/** Updates the derived latency totals that combine measured and modeled stages. */
+static void stats_overlay_snapshot_update_latency_totals(PSTATS_OVERLAY_SNAPSHOT snapshot) {
+  double frame_period_ms = stats_overlay_frame_period_ms(snapshot);
+  bool observed_available = snapshot->host_latency_avg_ms.available &&
+      snapshot->network_latency_avg_ms.available &&
+      snapshot->frame_assembly_delay_avg_ms.available &&
+      snapshot->queue_delay_avg_ms.available;
+
+  // Keep the observed total strictly additive by using only non-overlapping measured stages.
+  stats_overlay_snapshot_set_value(&snapshot->observed_stream_to_display_latency_avg_ms,
+      observed_available,
+      observed_available ?
+          snapshot->host_latency_avg_ms.value +
+          snapshot->network_latency_avg_ms.value +
+          snapshot->frame_assembly_delay_avg_ms.value +
+          snapshot->queue_delay_avg_ms.value : 0.0);
+
+  // The modeled total adds approximations for uplink plus one frame each of host pacing and client scanout.
+  stats_overlay_snapshot_set_value(&snapshot->estimated_end_to_end_latency_avg_ms,
+      observed_available && snapshot->network_latency_avg_ms.available && frame_period_ms > 0.0,
+      observed_available && snapshot->network_latency_avg_ms.available && frame_period_ms > 0.0 ?
+          snapshot->observed_stream_to_display_latency_avg_ms.value +
+          snapshot->network_latency_avg_ms.value +
+          (2.0 * frame_period_ms) : 0.0);
+}
+
 /** Initializes the session preference with the default disabled state. */
 void stats_overlay_pref_init(PSTATS_OVERLAY_PREFERENCE pref) {
   pref->enabled = false;
@@ -143,6 +183,7 @@ void stats_overlay_snapshot_init(PSTATS_OVERLAY_SNAPSHOT snapshot) {
 void stats_overlay_snapshot_set_stream(PSTATS_OVERLAY_SNAPSHOT snapshot, int width, int height, double fps, const char* codec) {
   snapshot->video_width = width;
   snapshot->video_height = height;
+  snapshot->configured_video_fps = fps;
   snapshot->video_fps = fps;
   snprintf(snapshot->codec, sizeof(snapshot->codec), "%s", codec ? codec : "Unknown");
   snapshot->updated_at_ms = stats_overlay_now_ms();
@@ -238,14 +279,26 @@ bool stats_overlay_update(PSTATS_OVERLAY_STATE state, const PSTATS_OVERLAY_SNAPS
   format_value(buffer_b, sizeof(buffer_b), &snapshot->network_latency_variance_ms, " ms");
   snprintf(state->formatted_lines[8], sizeof(state->formatted_lines[8]), "Average network latency: %s (variance: %s)", buffer_a, buffer_b);
 
+  format_value(buffer_a, sizeof(buffer_a), &snapshot->frame_assembly_delay_avg_ms, " ms");
+  snprintf(state->formatted_lines[9], sizeof(state->formatted_lines[9]), "Average frame assembly delay: %s", buffer_a);
+
+  format_value(buffer_a, sizeof(buffer_a), &snapshot->observed_stream_to_display_latency_avg_ms, " ms");
+  snprintf(state->formatted_lines[10], sizeof(state->formatted_lines[10]), "Observed stream-to-display latency: %s", buffer_a);
+
+  format_value(buffer_a, sizeof(buffer_a), &snapshot->estimated_end_to_end_latency_avg_ms, " ms");
+  snprintf(state->formatted_lines[11], sizeof(state->formatted_lines[11]), "Estimated end-to-end latency (modeled): %s", buffer_a);
+
+  format_value(buffer_a, sizeof(buffer_a), &snapshot->decoder_backlog_latency_avg_ms, " ms");
+  snprintf(state->formatted_lines[12], sizeof(state->formatted_lines[12]), "Decoder backlog latency: %s", buffer_a);
+
   format_value(buffer_a, sizeof(buffer_a), &snapshot->decode_time_avg_ms, " ms");
-  snprintf(state->formatted_lines[9], sizeof(state->formatted_lines[9]), "Average decoding time: %s", buffer_a);
+  snprintf(state->formatted_lines[13], sizeof(state->formatted_lines[13]), "Average decoding time: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->queue_delay_avg_ms, " ms");
-  snprintf(state->formatted_lines[10], sizeof(state->formatted_lines[10]), "Average queue delay: %s", buffer_a);
+  snprintf(state->formatted_lines[14], sizeof(state->formatted_lines[14]), "Average queue delay: %s", buffer_a);
 
   format_value(buffer_a, sizeof(buffer_a), &snapshot->render_time_avg_ms, " ms");
-  snprintf(state->formatted_lines[11], sizeof(state->formatted_lines[11]), "Average rendering time (including monitor V-sync latency): %s", buffer_a);
+  snprintf(state->formatted_lines[15], sizeof(state->formatted_lines[15]), "Average rendering time (including monitor V-sync latency): %s", buffer_a);
 
   state->line_count = STATS_OVERLAY_MAX_LINES;
   state->last_format_ms = now_ms;
@@ -286,11 +339,20 @@ void stats_overlay_runtime_stop(void) {
 void stats_overlay_runtime_note_decode_unit(const PDECODE_UNIT decode_unit) {
   // Moonlight reports host latency in tenths of a millisecond, so divide by 10 to display real milliseconds.
   double host_latency_ms = decode_unit->frameHostProcessingLatency / 10.0;
+  double frame_assembly_delay_ms = 0.0;
 
   pthread_mutex_lock(&stats_overlay_runtime_mutex);
 
   stats_overlay_runtime_window.incoming_frames++;
   stats_overlay_window_push_enqueue_time(&stats_overlay_runtime_window, decode_unit->enqueueTimeUs);
+
+  if (decode_unit->receiveTimeUs != 0 &&
+      decode_unit->enqueueTimeUs >= decode_unit->receiveTimeUs) {
+    // Track the time spent receiving and assembling a complete frame before the decoder sees it.
+    frame_assembly_delay_ms = (decode_unit->enqueueTimeUs - decode_unit->receiveTimeUs) / 1000.0;
+    stats_overlay_runtime_window.frame_assembly_delay_total_ms += frame_assembly_delay_ms;
+    stats_overlay_runtime_window.frame_assembly_delay_count++;
+  }
 
   if (decode_unit->presentationTimeUs != 0) {
     if (stats_overlay_runtime_window.last_presentation_time_us != 0 &&
@@ -324,6 +386,18 @@ void stats_overlay_runtime_note_skipped_frame(void) {
 
   stats_overlay_runtime_window.skipped_frames++;
   stats_overlay_runtime_window.skipped_frames_total++;
+
+  pthread_mutex_unlock(&stats_overlay_runtime_mutex);
+}
+
+/** Records backend-specific decoder backlog or display-delay samples when available. */
+void stats_overlay_runtime_note_decoder_backlog(double backlog_ms) {
+  pthread_mutex_lock(&stats_overlay_runtime_mutex);
+
+  if (backlog_ms >= 0.0) {
+    stats_overlay_runtime_window.decoder_backlog_latency_total_ms += backlog_ms;
+    stats_overlay_runtime_window.decoder_backlog_latency_count++;
+  }
 
   pthread_mutex_unlock(&stats_overlay_runtime_mutex);
 }
@@ -421,6 +495,14 @@ bool stats_overlay_runtime_refresh(void) {
         // Queue delay is accumulated per frame in milliseconds, so divide by the sample count for the average.
         stats_overlay_runtime_window.queue_delay_count != 0 ?
             stats_overlay_runtime_window.queue_delay_total_ms / stats_overlay_runtime_window.queue_delay_count : 0.0);
+    stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.frame_assembly_delay_avg_ms,
+        stats_overlay_runtime_window.frame_assembly_delay_count != 0,
+        stats_overlay_runtime_window.frame_assembly_delay_count != 0 ?
+            stats_overlay_runtime_window.frame_assembly_delay_total_ms / stats_overlay_runtime_window.frame_assembly_delay_count : 0.0);
+    stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.decoder_backlog_latency_avg_ms,
+        stats_overlay_runtime_window.decoder_backlog_latency_count != 0,
+        stats_overlay_runtime_window.decoder_backlog_latency_count != 0 ?
+            stats_overlay_runtime_window.decoder_backlog_latency_total_ms / stats_overlay_runtime_window.decoder_backlog_latency_count : 0.0);
 
     if (stats_overlay_runtime_window.host_latency_count != 0) {
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.host_latency_min_ms, true, stats_overlay_runtime_window.host_latency_min_ms);
@@ -466,6 +548,9 @@ bool stats_overlay_runtime_refresh(void) {
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_avg_ms, false, 0.0);
       stats_overlay_snapshot_set_value(&stats_overlay_runtime_snapshot.network_latency_variance_ms, false, 0.0);
     }
+
+    // Derive measured and modeled totals only after the component metrics have been refreshed.
+    stats_overlay_snapshot_update_latency_totals(&stats_overlay_runtime_snapshot);
 
     stats_overlay_window_reset(&stats_overlay_runtime_window, now_ms);
   }
