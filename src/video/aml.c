@@ -62,8 +62,6 @@
 #define AML_BACKLOG_WINDOW_MAX_SAMPLES 120
 #define AML_PIPELINE_STALL_US (500ULL * 1000ULL)
 #define AML_AWAIT_IDR_TIMEOUT_US (1000ULL * 1000ULL)
-#define AML_STEADY_STATE_PENDING_FRAMES 1
-#define AML_STARTUP_PENDING_FRAMES 2
 #define AML_SUBMIT_THROTTLE_TIMEOUT_FRAMES 2ULL
 #define AML_DEFAULT_FRAME_DURATION_US 16667ULL
 #define AML_DQBUF_HIST_BUCKETS 8
@@ -119,7 +117,6 @@ static unsigned int amlConfiguredFrameDurationTicks = 0;
 static uint64_t amlConfiguredFrameDurationUs = AML_DEFAULT_FRAME_DURATION_US;
 static int amlFracRatePolicy = -1;
 static bool amlDisplayTrackingEnabled = false;
-static bool amlPlaybackStarted = false;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -683,7 +680,6 @@ static void aml_reset_decode_submit_times(void) {
 
   pendingDecodeSubmitHead = 0;
   pendingDecodeSubmitCount = 0;
-  amlPlaybackStarted = false;
   amlBacklogEpisodeStartUs = 0;
   amlBacklogEpisodeReportPending = false;
   pthread_cond_broadcast(&pendingDecodeSubmitCond);
@@ -698,20 +694,11 @@ static void aml_reset_decode_submit_times(void) {
   pthread_mutex_unlock(&amlDebugMutex);
 }
 
-/** Marks AML playback as active once the display path starts draining frames. */
-static void aml_mark_playback_started(void) {
-  pthread_mutex_lock(&pendingDecodeSubmitMutex);
-
-  amlPlaybackStarted = true;
-  pthread_cond_broadcast(&pendingDecodeSubmitCond);
-
-  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
-}
-
-/** Waits briefly for AML to drain back to the desired low-latency queue depth before submitting another frame. */
+/** Waits briefly for AML to drain below the in-flight hard cap before submitting another frame. */
 static void aml_wait_for_submit_capacity(void) {
   struct timespec deadline;
   uint64_t wait_timeout_us;
+  unsigned int timed_out_depth = 0;
 
   if (!amlDisplayTrackingEnabled)
     return;
@@ -729,15 +716,23 @@ static void aml_wait_for_submit_capacity(void) {
 
   pthread_mutex_lock(&pendingDecodeSubmitMutex);
 
-  // Allow a short two-frame startup pre-roll, then hold AML at one submitted frame in steady state.
+  // Lenient hard cap: steady state sits at ~1 in-flight frame on its own, so blocking only at the cap lets
+  // jitter bursts ride through at depth 2-4 instead of stalling the common-c decoder thread on every frame.
+  // The two-frame-time deadline bounds the worst-case forced-submit rate; genuine pathology is the resync
+  // backstop's job, not this wait's.
   while (!done &&
          amlDisplayTrackingEnabled &&
-         pendingDecodeSubmitCount >= (amlPlaybackStarted ? AML_STEADY_STATE_PENDING_FRAMES : AML_STARTUP_PENDING_FRAMES)) {
-    if (pthread_cond_timedwait(&pendingDecodeSubmitCond, &pendingDecodeSubmitMutex, &deadline) == ETIMEDOUT)
+         pendingDecodeSubmitCount >= AML_MAX_PENDING_FRAMES) {
+    if (pthread_cond_timedwait(&pendingDecodeSubmitCond, &pendingDecodeSubmitMutex, &deadline) == ETIMEDOUT) {
+      timed_out_depth = pendingDecodeSubmitCount;
       break;
+    }
   }
 
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+
+  if (timed_out_depth != 0 && aml_debug_enabled())
+    printf("AML debug: submit hard-cap timeout at depth %u\n", timed_out_depth);
 }
 
 /** Queues the submit timestamp for a compressed frame entering the AML decoder pipeline. */
@@ -1146,7 +1141,6 @@ void* aml_display_thread(void* unused) {
         aml_debug_note_dqbuf_interval(frame_completed_us - prev_frame_completed_us);
       prev_frame_completed_us = frame_completed_us;
     }
-    aml_mark_playback_started();
     if (aml_pop_decode_submit_time(&submit_started_us, &depth_after_pop) && frame_completed_us >= submit_started_us) {
       double decode_latency_ms = (frame_completed_us - submit_started_us) / 1000.0;
 
@@ -1232,7 +1226,6 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlConfiguredFrameDurationUs = redrawRate > 0 ? (1000000ULL / (uint64_t) redrawRate) : AML_DEFAULT_FRAME_DURATION_US;
   amlFracRatePolicy = -1;
   amlDisplayTrackingEnabled = false;
-  amlPlaybackStarted = false;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   amlInduceStallMs = 0;
   amlInduceStallDone = false;
