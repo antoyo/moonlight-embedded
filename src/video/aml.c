@@ -63,6 +63,8 @@
 #define AML_STARTUP_PENDING_FRAMES 2
 #define AML_SUBMIT_THROTTLE_TIMEOUT_FRAMES 2ULL
 #define AML_DEFAULT_FRAME_DURATION_US 16667ULL
+#define AML_DQBUF_HIST_BUCKETS 8
+#define AML_INDUCE_STALL_DELAY_US (30ULL * 1000ULL * 1000ULL)
 
 static codec_para_t codecParam = { 0 };
 static pthread_t displayThread;
@@ -81,6 +83,17 @@ static int overlayHeight = 0;
 static uint64_t pendingDecodeSubmitTimesUs[256];
 static unsigned int pendingDecodeSubmitHead = 0;
 static unsigned int pendingDecodeSubmitCount = 0;
+// Backlog-episode tracking (guarded by pendingDecodeSubmitMutex): one episode spans the time the
+// submit FIFO stays at depth >= 2, so -verbose logs can show how fast the pipeline drains a backlog.
+static uint64_t amlBacklogEpisodeStartUs = 0;
+static unsigned int amlBacklogEpisodePeakDepth = 0;
+static unsigned int amlBacklogEpisodeDqbufCount = 0;
+static bool amlBacklogEpisodeReportPending = false;
+static uint64_t amlBacklogEpisodeReportDurationUs = 0;
+static unsigned int amlBacklogEpisodeReportPeakDepth = 0;
+static unsigned int amlBacklogEpisodeReportDqbufCount = 0;
+static unsigned int amlInduceStallMs = 0;
+static bool amlInduceStallDone = false;
 static bool overlayEnabled = false;
 static bool overlayReady = false;
 static bool overlayWarningEmitted = false;
@@ -124,6 +137,7 @@ typedef struct _AML_DEBUG_METRICS {
   unsigned int codec_write_eagain_count;
   unsigned int decoded_frame_count;
   unsigned int submit_fifo_depth_max;
+  uint64_t dqbuf_interval_hist[AML_DQBUF_HIST_BUCKETS];
   double decode_latency_total_ms;
   double decode_latency_max_ms;
   double video_delay_total_ms;
@@ -439,6 +453,27 @@ static void aml_debug_note_codec_write(uint64_t write_elapsed_us, uint64_t stall
   pthread_mutex_unlock(&amlDebugMutex);
 }
 
+/** Buckets the elapsed time between consecutive AML DQBUF completions to expose the pipeline drain cadence. */
+static void aml_debug_note_dqbuf_interval(uint64_t interval_us) {
+  // Bucket edges in ms: <10, 10-14, 14-19, 19-25, 25-31, 31-37, 37-50, >=50. The 14-19 bucket brackets one
+  // 60 Hz vsync and 31-37 one 30 fps frame period, so drain bursts stand out from steady-state cadence.
+  static const uint64_t bucket_upper_bounds_us[AML_DQBUF_HIST_BUCKETS - 1] =
+      { 10000, 14000, 19000, 25000, 31000, 37000, 50000 };
+  size_t bucket = 0;
+
+  while (bucket < AML_DQBUF_HIST_BUCKETS - 1 && interval_us >= bucket_upper_bounds_us[bucket])
+    bucket++;
+
+  pthread_mutex_lock(&amlDebugMutex);
+
+  if (amlDebugMetrics.window_started_us == 0)
+    amlDebugMetrics.window_started_us = LiGetMicroseconds();
+
+  amlDebugMetrics.dqbuf_interval_hist[bucket]++;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
 /** Notes that the AML display thread waited a poll interval without a decoded frame becoming ready. */
 static void aml_debug_note_dqbuf_poll_timeout(void) {
   pthread_mutex_lock(&amlDebugMutex);
@@ -499,11 +534,16 @@ static void aml_debug_note_frame(double decode_latency_ms, int video_delay_ms) {
     // Emit one compact line so long-running Vero V sessions can reveal whether latency is drifting or being clamped.
     printf("AML debug: %.1f fps, submit->output avg %.2f ms max %.2f ms, "
            "amcodec delay avg %.2f ms max %d ms last %d ms, codec_write avg %.2f ms stall %.2f ms, "
-           "write EAGAIN %u, DQBUF poll timeouts %llu, submit FIFO max %u%s%s\n",
+           "write EAGAIN %u, DQBUF poll timeouts %llu, submit FIFO max %u, "
+           "dqbuf ms [<10:%llu 10-14:%llu 14-19:%llu 19-25:%llu 25-31:%llu 31-37:%llu 37-50:%llu >50:%llu]%s%s\n",
         frame_rate, avg_decode_latency_ms, amlDebugMetrics.decode_latency_max_ms,
         avg_video_delay_ms, amlDebugMetrics.video_delay_max_ms, amlDebugMetrics.video_delay_last_ms,
         avg_write_ms, avg_stall_ms, amlDebugMetrics.codec_write_eagain_count,
         (unsigned long long) amlDebugMetrics.dqbuf_poll_timeout_count, amlDebugMetrics.submit_fifo_depth_max,
+        (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[0], (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[1],
+        (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[2], (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[3],
+        (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[4], (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[5],
+        (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[6], (unsigned long long) amlDebugMetrics.dqbuf_interval_hist[7],
         amlDebugMetrics.display_mode[0] != '\0' ? ", display mode " : "",
         amlDebugMetrics.display_mode[0] != '\0' ? amlDebugMetrics.display_mode : "");
     aml_debug_reset_window(now_us);
@@ -642,6 +682,8 @@ static void aml_reset_decode_submit_times(void) {
   pendingDecodeSubmitHead = 0;
   pendingDecodeSubmitCount = 0;
   amlPlaybackStarted = false;
+  amlBacklogEpisodeStartUs = 0;
+  amlBacklogEpisodeReportPending = false;
   pthread_cond_broadcast(&pendingDecodeSubmitCond);
 
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
@@ -716,6 +758,16 @@ static void aml_push_decode_submit_time(uint64_t submit_time_us) {
   pendingDecodeSubmitCount++;
   queue_depth = pendingDecodeSubmitCount;
 
+  if (pendingDecodeSubmitCount >= 2) {
+    if (amlBacklogEpisodeStartUs == 0) {
+      amlBacklogEpisodeStartUs = submit_time_us;
+      amlBacklogEpisodePeakDepth = pendingDecodeSubmitCount;
+      amlBacklogEpisodeDqbufCount = 0;
+    } else if (pendingDecodeSubmitCount > amlBacklogEpisodePeakDepth) {
+      amlBacklogEpisodePeakDepth = pendingDecodeSubmitCount;
+    }
+  }
+
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
   aml_debug_note_submit_depth(queue_depth);
 }
@@ -734,10 +786,44 @@ static bool aml_pop_decode_submit_time(uint64_t* submit_time_us) {
     pendingDecodeSubmitCount--;
     have_sample = true;
     pthread_cond_broadcast(&pendingDecodeSubmitCond);
+
+    if (amlBacklogEpisodeStartUs != 0) {
+      amlBacklogEpisodeDqbufCount++;
+      if (pendingDecodeSubmitCount <= 1) {
+        // Episode over: stash a report for the display thread to print outside this lock.
+        amlBacklogEpisodeReportPending = true;
+        amlBacklogEpisodeReportDurationUs = LiGetMicroseconds() - amlBacklogEpisodeStartUs;
+        amlBacklogEpisodeReportPeakDepth = amlBacklogEpisodePeakDepth;
+        amlBacklogEpisodeReportDqbufCount = amlBacklogEpisodeDqbufCount;
+        amlBacklogEpisodeStartUs = 0;
+      }
+    }
   }
 
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
   return have_sample;
+}
+
+/** Prints a completed backlog-episode summary so drain behavior can be inspected from -verbose logs. */
+static void aml_debug_report_backlog_episode(int video_delay_ms) {
+  bool pending;
+  uint64_t duration_us;
+  unsigned int peak_depth;
+  unsigned int dqbuf_count;
+
+  pthread_mutex_lock(&pendingDecodeSubmitMutex);
+
+  pending = amlBacklogEpisodeReportPending;
+  duration_us = amlBacklogEpisodeReportDurationUs;
+  peak_depth = amlBacklogEpisodeReportPeakDepth;
+  dqbuf_count = amlBacklogEpisodeReportDqbufCount;
+  amlBacklogEpisodeReportPending = false;
+
+  pthread_mutex_unlock(&pendingDecodeSubmitMutex);
+
+  if (pending)
+    printf("AML debug: backlog episode peak %u cleared in %.1f ms (%u dqbufs, video_delay %d ms)\n",
+        peak_depth, duration_us / 1000.0, dqbuf_count, video_delay_ms);
 }
 
 /** Returns the current number of AML frames queued between submit and display completion. */
@@ -970,6 +1056,8 @@ static bool aml_wait_for_frame_ready(void) {
 
 /** Drains AML display buffers and refreshes the OSD overlay once per presented frame. */
 void* aml_display_thread(void* unused) {
+  uint64_t prev_frame_completed_us = 0;
+
   while (!done) {
     struct v4l2_buffer vbuf = { 0 };
     uint64_t frame_completed_us;
@@ -977,6 +1065,14 @@ void* aml_display_thread(void* unused) {
     uint64_t submit_started_us = 0;
     int video_delay_ms = -1;
     vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    // Debug-only experiment hook: stall the drain loop once so backlog recovery behavior can be observed on demand.
+    if (amlInduceStallMs != 0 && !amlInduceStallDone &&
+        LiGetMicroseconds() >= amlDebugSessionStartedUs + AML_INDUCE_STALL_DELAY_US) {
+      amlInduceStallDone = true;
+      printf("AML debug: inducing display stall of %u ms\n", amlInduceStallMs);
+      usleep(amlInduceStallMs * 1000);
+    }
 
     if (!aml_wait_for_frame_ready())
       break;
@@ -993,6 +1089,11 @@ void* aml_display_thread(void* unused) {
 
     // A dequeued AML capture buffer corresponds to a frame that has completed the hardware decode/display pipeline.
     frame_completed_us = LiGetMicroseconds();
+    if (aml_debug_enabled()) {
+      if (prev_frame_completed_us != 0)
+        aml_debug_note_dqbuf_interval(frame_completed_us - prev_frame_completed_us);
+      prev_frame_completed_us = frame_completed_us;
+    }
     aml_mark_playback_started();
     if (aml_pop_decode_submit_time(&submit_started_us) && frame_completed_us >= submit_started_us) {
       double decode_latency_ms = (frame_completed_us - submit_started_us) / 1000.0;
@@ -1025,6 +1126,9 @@ void* aml_display_thread(void* unused) {
                aml_debug_enabled()) {
       aml_debug_note_frame(0.0, video_delay_ms);
     }
+
+    if (aml_debug_enabled())
+      aml_debug_report_backlog_episode(video_delay_ms);
 
     if (ioctl(videoFd, VIDIOC_QBUF, &vbuf) < 0) {
       fprintf(stderr, "VIDIOC_QBUF failed: %d\n", errno);
@@ -1069,6 +1173,14 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlDisplayTrackingEnabled = false;
   amlPlaybackStarted = false;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
+  amlInduceStallMs = 0;
+  amlInduceStallDone = false;
+  if (amlDebugEnabled) {
+    const char* induce_stall_ms = getenv("MOONLIGHT_AML_INDUCE_STALL_MS");
+
+    if (induce_stall_ms != NULL)
+      amlInduceStallMs = (unsigned int) strtoul(induce_stall_ms, NULL, 10);
+  }
   aml_optional_apis_init();
   aml_reset_decode_submit_times();
   overlayWarningEmitted = false;
