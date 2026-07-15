@@ -65,6 +65,7 @@
 #define AML_DEFAULT_FRAME_DURATION_US 16667ULL
 #define AML_DQBUF_HIST_BUCKETS 8
 #define AML_INDUCE_STALL_DELAY_US (30ULL * 1000ULL * 1000ULL)
+#define AML_FIFO_LEAK_WARN_DEPTH 32
 
 static codec_para_t codecParam = { 0 };
 static pthread_t displayThread;
@@ -770,6 +771,11 @@ static void aml_push_decode_submit_time(uint64_t submit_time_us) {
 
   pthread_mutex_unlock(&pendingDecodeSubmitMutex);
   aml_debug_note_submit_depth(queue_depth);
+
+  // A real backlog is capped near AML_MAX_PENDING_FRAMES by the submit throttle and resync backstop, so a
+  // depth this high means submits and DQBUFs are no longer 1:1 (a frame leak in the pipeline accounting).
+  if (aml_debug_enabled() && queue_depth == AML_FIFO_LEAK_WARN_DEPTH + 1)
+    printf("AML debug: submit FIFO depth crossed %u; possible submit/DQBUF accounting leak\n", queue_depth);
 }
 
 /** Pops the oldest submit timestamp once the AML pipeline finishes a frame. */
@@ -901,8 +907,8 @@ static bool aml_should_drop_for_resync(const PDECODE_UNIT decodeUnit) {
     return false;
 
   if (decodeUnit->frameType == FRAME_TYPE_IDR) {
-    // Forget stale submit timestamps so the next latency samples start from the new decoder anchor frame.
-    aml_reset_decode_submit_times();
+    // Keep the submit-timestamp FIFO intact: the decoder was never reset on this path, so every frame
+    // submitted before the drop window still drains through DQBUF and stays 1:1 with its FIFO entry.
     amlAwaitingIdr = false;
     if (aml_debug_enabled())
       printf("AML debug: received IDR after backlog drain, resuming normal submit path\n");
@@ -1341,8 +1347,6 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
       LiRequestIdrFrame();
       return DR_OK;
     }
-
-    aml_reset_decode_submit_times();
   }
 
   if (overlayEnabled)
@@ -1367,6 +1371,9 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
       if (errno != EAGAIN) {
         fprintf(stderr, "codec_write() error: %x %d\n", errno, api);
         codec_reset(&codecParam);
+        // The reset flushed every in-flight frame, so their FIFO entries would otherwise never be popped
+        // and the measured depth/latency would stay skewed for the rest of the session.
+        aml_reset_decode_submit_times();
         break;
       } else {
         uint64_t stall_started_us = LiGetMicroseconds();
