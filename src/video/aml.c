@@ -53,12 +53,15 @@
 #define AML_DEBUG_INTERVAL_US (1000ULL * 1000ULL)
 #define AML_DEFAULT_DELAY_LIMIT_MS 16
 #define AML_DEBUG_MILESTONE_COUNT 3
-#define AML_LOW_LATENCY_PENDING_FRAMES 2
 #define AML_MAX_PENDING_FRAMES 4
-#define AML_FALLBACK_RESYNC_THRESHOLD_MS 24.0
-#define AML_LOW_LATENCY_RESYNC_ARM_US (125ULL * 1000ULL)
+#define AML_FALLBACK_RESYNC_THRESHOLD_MS 58.0
 #define AML_RESYNC_STARTUP_GRACE_US (5ULL * 1000ULL * 1000ULL)
-#define AML_RESYNC_COOLDOWN_US (1000ULL * 1000ULL)
+#define AML_RESYNC_COOLDOWN_US (15ULL * 1000ULL * 1000ULL)
+#define AML_RESYNC_LATENCY_THRESHOLD_FRAMES_X2 7
+#define AML_BACKLOG_WINDOW_MIN_SAMPLES 15
+#define AML_BACKLOG_WINDOW_MAX_SAMPLES 120
+#define AML_PIPELINE_STALL_US (500ULL * 1000ULL)
+#define AML_AWAIT_IDR_TIMEOUT_US (1000ULL * 1000ULL)
 #define AML_STEADY_STATE_PENDING_FRAMES 1
 #define AML_STARTUP_PENDING_FRAMES 2
 #define AML_SUBMIT_THROTTLE_TIMEOUT_FRAMES 2ULL
@@ -103,9 +106,14 @@ static uint32_t overlayBgColor = 0;
 static int amlTargetDelayMs = AML_DEFAULT_DELAY_LIMIT_MS;
 static bool amlDebugEnabled = false;
 static uint64_t amlLastResyncRequestUs = 0;
-static uint64_t amlLowLatencyResyncEligibleSinceUs = 0;
 static bool amlAwaitingIdr = false;
+static uint64_t amlAwaitingIdrSinceUs = 0;
 static double amlLatestDecodeLatencyMs = 0.0;
+// Sustained-backlog window (guarded by amlDebugMutex): counts consecutive DQBUF samples that showed a
+// standing queue with high latency; one window's worth arms the resync backstop, any good frame resets it.
+static unsigned int amlBacklogWindowSamples = 30;
+static unsigned int amlBacklogConsecutiveSamples = 0;
+static uint64_t amlLastDqbufUs = 0;
 static int amlConfiguredRateX100 = 0;
 static unsigned int amlConfiguredFrameDurationTicks = 0;
 static uint64_t amlConfiguredFrameDurationUs = AML_DEFAULT_FRAME_DURATION_US;
@@ -487,15 +495,6 @@ static void aml_debug_note_dqbuf_poll_timeout(void) {
   pthread_mutex_unlock(&amlDebugMutex);
 }
 
-/** Stores the latest AML submit-to-output latency sample so recovery logic works even when debug logging is off. */
-static void aml_record_decode_latency_sample(double decode_latency_ms) {
-  pthread_mutex_lock(&amlDebugMutex);
-
-  amlLatestDecodeLatencyMs = decode_latency_ms;
-
-  pthread_mutex_unlock(&amlDebugMutex);
-}
-
 /** Records AML pipeline-latency samples and emits a once-per-second summary when debug is active. */
 static void aml_debug_note_frame(double decode_latency_ms, int video_delay_ms) {
   uint64_t now_us = LiGetMicroseconds();
@@ -671,8 +670,10 @@ static uint64_t aml_submit_throttle_timeout_us(void) {
 
 /** Returns the latency level where AML should abandon the current decoder history and resync to a fresh IDR. */
 static double aml_resync_latency_threshold_ms(void) {
+  // 3.5 frame-times: ~117 ms at 30 fps, ~58 ms at 60 fps. Well above the pipeline's healthy submit-to-output
+  // time (which includes at least one display refresh) so only a genuine standing backlog can reach it.
   return amlConfiguredFrameDurationUs != 0 ?
-      (amlConfiguredFrameDurationUs * 3.0) / 2000.0 :
+      (amlConfiguredFrameDurationUs * (double) AML_RESYNC_LATENCY_THRESHOLD_FRAMES_X2) / 2000.0 :
       AML_FALLBACK_RESYNC_THRESHOLD_MS;
 }
 
@@ -692,6 +693,7 @@ static void aml_reset_decode_submit_times(void) {
   pthread_mutex_lock(&amlDebugMutex);
 
   amlLatestDecodeLatencyMs = 0.0;
+  amlBacklogConsecutiveSamples = 0;
 
   pthread_mutex_unlock(&amlDebugMutex);
 }
@@ -778,12 +780,13 @@ static void aml_push_decode_submit_time(uint64_t submit_time_us) {
     printf("AML debug: submit FIFO depth crossed %u; possible submit/DQBUF accounting leak\n", queue_depth);
 }
 
-/** Pops the oldest submit timestamp once the AML pipeline finishes a frame. */
-static bool aml_pop_decode_submit_time(uint64_t* submit_time_us) {
+/** Pops the oldest submit timestamp once the AML pipeline finishes a frame, reporting the depth left behind. */
+static bool aml_pop_decode_submit_time(uint64_t* submit_time_us, unsigned int* remaining_depth) {
   bool have_sample;
 
   pthread_mutex_lock(&pendingDecodeSubmitMutex);
 
+  *remaining_depth = pendingDecodeSubmitCount != 0 ? pendingDecodeSubmitCount - 1 : 0;
   if (pendingDecodeSubmitCount == 0)
     have_sample = false;
   else {
@@ -856,48 +859,78 @@ static double aml_latest_decode_latency_ms(void) {
   return latest_latency_ms;
 }
 
-/** Returns true when the AML pipeline backlog is high enough that low-latency recovery should kick in. */
+/** Records one DQBUF-paced pipeline sample and advances or resets the sustained-backlog window. */
+static void aml_record_pipeline_sample(unsigned int depth_after_pop, double latency_ms) {
+  pthread_mutex_lock(&amlDebugMutex);
+
+  amlLatestDecodeLatencyMs = latency_ms;
+  amlLastDqbufUs = LiGetMicroseconds();
+  // qt-Pacer-style predicate: a resync is warranted only if EVERY recent sample shows both a standing
+  // queue (depth >= 2 after popping) and a high latency. Any single good frame resets the window, so
+  // transient jitter bursts are absorbed instead of corrected.
+  if (depth_after_pop >= 2 && latency_ms >= aml_resync_latency_threshold_ms())
+    amlBacklogConsecutiveSamples++;
+  else
+    amlBacklogConsecutiveSamples = 0;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
+/** Notes a DQBUF that produced no usable latency sample; treated as a good frame so the backstop window restarts. */
+static void aml_record_unmatched_dqbuf(void) {
+  pthread_mutex_lock(&amlDebugMutex);
+
+  amlLastDqbufUs = LiGetMicroseconds();
+  amlBacklogConsecutiveSamples = 0;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+}
+
+/** Returns true when the AML pipeline backlog is severe enough that last-resort recovery should kick in. */
 static bool aml_should_request_resync(unsigned int pending_depth) {
-  double latest_latency_ms;
-  double resync_latency_threshold_ms;
   uint64_t now_us;
+  uint64_t last_dqbuf_us;
+  unsigned int consecutive_samples;
+  bool sustained_backlog;
+  bool pipeline_stalled;
 
   if (!amlDisplayTrackingEnabled)
     return false;
 
-  if (pending_depth < AML_LOW_LATENCY_PENDING_FRAMES) {
-    amlLowLatencyResyncEligibleSinceUs = 0;
-    return false;
-  }
-
   now_us = LiGetMicroseconds();
-  if (amlDebugSessionStartedUs != 0 && now_us < amlDebugSessionStartedUs + AML_RESYNC_STARTUP_GRACE_US) {
-    amlLowLatencyResyncEligibleSinceUs = 0;
+  if (amlDebugSessionStartedUs != 0 && now_us < amlDebugSessionStartedUs + AML_RESYNC_STARTUP_GRACE_US)
     return false;
-  }
-  if (amlLastResyncRequestUs != 0 && now_us < amlLastResyncRequestUs + AML_RESYNC_COOLDOWN_US) {
-    amlLowLatencyResyncEligibleSinceUs = 0;
+  if (amlLastResyncRequestUs != 0 && now_us < amlLastResyncRequestUs + AML_RESYNC_COOLDOWN_US)
     return false;
-  }
 
-  latest_latency_ms = aml_latest_decode_latency_ms();
-  resync_latency_threshold_ms = aml_resync_latency_threshold_ms();
-  if (pending_depth < AML_MAX_PENDING_FRAMES && latest_latency_ms < resync_latency_threshold_ms) {
-    amlLowLatencyResyncEligibleSinceUs = 0;
-    return false;
-  }
+  pthread_mutex_lock(&amlDebugMutex);
 
-  if (amlLowLatencyResyncEligibleSinceUs == 0) {
-    // Arm recovery only after the queue remains above the low-latency threshold long enough to rule out transient spikes.
-    amlLowLatencyResyncEligibleSinceUs = now_us;
-    return false;
-  }
-  if (now_us < amlLowLatencyResyncEligibleSinceUs + AML_LOW_LATENCY_RESYNC_ARM_US)
+  consecutive_samples = amlBacklogConsecutiveSamples;
+  last_dqbuf_us = amlLastDqbufUs;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+
+  // Backstop 1: every DQBUF sample for about one second showed a standing queue with high latency.
+  sustained_backlog = consecutive_samples >= amlBacklogWindowSamples;
+  // Backstop 2: DQBUFs stopped entirely while the submit side sits at the hard cap. A stalled display
+  // thread produces no samples, so the sustained window alone could never fire in that state.
+  pipeline_stalled = pending_depth >= AML_MAX_PENDING_FRAMES &&
+                     last_dqbuf_us != 0 && now_us > last_dqbuf_us + AML_PIPELINE_STALL_US;
+  if (!sustained_backlog && !pipeline_stalled)
     return false;
 
   // Throttle reset/IDR requests so a single burst of late frames cannot trap the session in a reset loop.
   amlLastResyncRequestUs = now_us;
-  amlLowLatencyResyncEligibleSinceUs = 0;
+
+  pthread_mutex_lock(&amlDebugMutex);
+
+  amlBacklogConsecutiveSamples = 0;
+
+  pthread_mutex_unlock(&amlDebugMutex);
+
+  if (aml_debug_enabled())
+    printf("AML debug: resync backstop fired (%s), depth %u, latest latency %.1f ms\n",
+        sustained_backlog ? "sustained backlog" : "pipeline stall", pending_depth, aml_latest_decode_latency_ms());
   return true;
 }
 
@@ -910,8 +943,20 @@ static bool aml_should_drop_for_resync(const PDECODE_UNIT decodeUnit) {
     // Keep the submit-timestamp FIFO intact: the decoder was never reset on this path, so every frame
     // submitted before the drop window still drains through DQBUF and stays 1:1 with its FIFO entry.
     amlAwaitingIdr = false;
+    amlAwaitingIdrSinceUs = 0;
     if (aml_debug_enabled())
       printf("AML debug: received IDR after backlog drain, resuming normal submit path\n");
+    return false;
+  }
+
+  if (amlAwaitingIdrSinceUs != 0 && LiGetMicroseconds() > amlAwaitingIdrSinceUs + AML_AWAIT_IDR_TIMEOUT_US) {
+    // The host never delivered the IDR we asked for; re-request once and resume submitting rather than
+    // dropping frames indefinitely. Brief corruption is preferable to an unbounded freeze.
+    amlAwaitingIdr = false;
+    amlAwaitingIdrSinceUs = 0;
+    LiRequestIdrFrame();
+    if (aml_debug_enabled())
+      printf("AML debug: IDR wait timed out, re-requesting IDR and resuming submits\n");
     return false;
   }
 
@@ -1069,6 +1114,7 @@ void* aml_display_thread(void* unused) {
     uint64_t frame_completed_us;
     uint64_t render_completed_us;
     uint64_t submit_started_us = 0;
+    unsigned int depth_after_pop = 0;
     int video_delay_ms = -1;
     vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
@@ -1101,11 +1147,11 @@ void* aml_display_thread(void* unused) {
       prev_frame_completed_us = frame_completed_us;
     }
     aml_mark_playback_started();
-    if (aml_pop_decode_submit_time(&submit_started_us) && frame_completed_us >= submit_started_us) {
+    if (aml_pop_decode_submit_time(&submit_started_us, &depth_after_pop) && frame_completed_us >= submit_started_us) {
       double decode_latency_ms = (frame_completed_us - submit_started_us) / 1000.0;
 
-      // Keep low-latency recovery armed from live pipeline samples regardless of whether verbose logging is enabled.
-      aml_record_decode_latency_sample(decode_latency_ms);
+      // Keep the backstop window fed from live pipeline samples regardless of whether verbose logging is enabled.
+      aml_record_pipeline_sample(depth_after_pop, decode_latency_ms);
 
       if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
           amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) != 0) {
@@ -1121,16 +1167,20 @@ void* aml_display_thread(void* unused) {
         stats_overlay_runtime_note_decoded_frame(decode_latency_ms);
       if (aml_debug_enabled())
         aml_debug_note_frame(decode_latency_ms, video_delay_ms);
-    } else if (overlayEnabled) {
-      if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
-          amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0) {
-        stats_overlay_runtime_note_decoder_backlog(video_delay_ms);
+    } else {
+      // No usable FIFO sample for this DQBUF; still record the drain progress so the backstop window restarts.
+      aml_record_unmatched_dqbuf();
+      if (overlayEnabled) {
+        if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
+            amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0) {
+          stats_overlay_runtime_note_decoder_backlog(video_delay_ms);
+        }
+        stats_overlay_runtime_note_decoded_output();
+      } else if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
+                 amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0 &&
+                 aml_debug_enabled()) {
+        aml_debug_note_frame(0.0, video_delay_ms);
       }
-      stats_overlay_runtime_note_decoded_output();
-    } else if (amlOptionalApis.get_video_cur_delay_ms != NULL &&
-               amlOptionalApis.get_video_cur_delay_ms(&codecParam, &video_delay_ms) == 0 &&
-               aml_debug_enabled()) {
-      aml_debug_note_frame(0.0, video_delay_ms);
     }
 
     if (aml_debug_enabled())
@@ -1169,9 +1219,14 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   videoFd = -1;
   amlDebugEnabled = video_context != NULL && video_context->debug_enabled;
   amlLastResyncRequestUs = 0;
-  amlLowLatencyResyncEligibleSinceUs = 0;
   amlAwaitingIdr = false;
+  amlAwaitingIdrSinceUs = 0;
   amlLatestDecodeLatencyMs = 0.0;
+  amlBacklogConsecutiveSamples = 0;
+  amlLastDqbufUs = 0;
+  // One second's worth of DQBUF samples must all look bad before the backstop may fire.
+  amlBacklogWindowSamples = redrawRate < AML_BACKLOG_WINDOW_MIN_SAMPLES ? AML_BACKLOG_WINDOW_MIN_SAMPLES :
+      (redrawRate > AML_BACKLOG_WINDOW_MAX_SAMPLES ? AML_BACKLOG_WINDOW_MAX_SAMPLES : (unsigned int) redrawRate);
   amlConfiguredRateX100 = redrawRate * 100;
   amlConfiguredFrameDurationTicks = 0;
   amlConfiguredFrameDurationUs = redrawRate > 0 ? (1000000ULL / (uint64_t) redrawRate) : AML_DEFAULT_FRAME_DURATION_US;
@@ -1334,6 +1389,11 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
     return DR_OK;
   }
 
+  if (overlayEnabled)
+    stats_overlay_runtime_note_decode_unit(decodeUnit);
+  aml_wait_for_submit_capacity();
+
+  // Evaluate the backstop only after the capacity wait so the depth reflects any drain that just happened.
   pending_depth = aml_pending_submit_depth();
   if (aml_should_request_resync(pending_depth)) {
     if (aml_debug_enabled()) {
@@ -1344,14 +1404,11 @@ int aml_submit_decode_unit(PDECODE_UNIT decodeUnit) {
 
     if (decodeUnit->frameType != FRAME_TYPE_IDR) {
       amlAwaitingIdr = true;
+      amlAwaitingIdrSinceUs = LiGetMicroseconds();
       LiRequestIdrFrame();
       return DR_OK;
     }
   }
-
-  if (overlayEnabled)
-    stats_overlay_runtime_note_decode_unit(decodeUnit);
-  aml_wait_for_submit_capacity();
 
   int written = 0, length = 0, errCounter = 0, api;
   PLENTRY entry = decodeUnit->bufferList;
