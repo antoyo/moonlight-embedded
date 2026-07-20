@@ -58,6 +58,7 @@
 #define AML_RESYNC_STARTUP_GRACE_US (5ULL * 1000ULL * 1000ULL)
 #define AML_RESYNC_COOLDOWN_US (15ULL * 1000ULL * 1000ULL)
 #define AML_RESYNC_LATENCY_THRESHOLD_FRAMES_X2 7
+#define AML_FRAME_MODE_RESYNC_THRESHOLD_FRAMES_X2 2
 #define AML_BACKLOG_WINDOW_MIN_SAMPLES 15
 #define AML_BACKLOG_WINDOW_MAX_SAMPLES 120
 #define AML_PIPELINE_STALL_US (500ULL * 1000ULL)
@@ -668,10 +669,16 @@ static uint64_t aml_submit_throttle_timeout_us(void) {
 
 /** Returns the latency level where AML should abandon the current decoder history and resync to a fresh IDR. */
 static double aml_resync_latency_threshold_ms(void) {
-  // 3.5 frame-times: ~117 ms at 30 fps, ~58 ms at 60 fps. Well above the pipeline's healthy submit-to-output
-  // time (which includes at least one display refresh) so only a genuine standing backlog can reach it.
+  // Frame mode decodes in ~3 ms, so a submit-to-output time of one full frame-period can only mean a frame
+  // is standing somewhere in the pipeline (a jitter blip parks one there permanently: output then tracks the
+  // NEXT frame's submit). 1.0 frame-time catches that stuck state with a wide margin over the healthy 3 ms.
+  // The stream-parser fallback mode has a natural standing time of ~2.2 frame-periods, so it keeps the old
+  // 3.5 frame-times threshold (~117 ms at 30 fps, ~58 ms at 60 fps) — below that it would resync forever.
+  unsigned int threshold_frames_x2 = amlFrameModeActive ?
+      AML_FRAME_MODE_RESYNC_THRESHOLD_FRAMES_X2 : AML_RESYNC_LATENCY_THRESHOLD_FRAMES_X2;
+
   return amlConfiguredFrameDurationUs != 0 ?
-      (amlConfiguredFrameDurationUs * (double) AML_RESYNC_LATENCY_THRESHOLD_FRAMES_X2) / 2000.0 :
+      (amlConfiguredFrameDurationUs * (double) threshold_frames_x2) / 2000.0 :
       AML_FALLBACK_RESYNC_THRESHOLD_MS;
 }
 
@@ -862,9 +869,12 @@ static void aml_record_pipeline_sample(unsigned int depth_after_pop, double late
   amlLatestDecodeLatencyMs = latency_ms;
   amlLastDqbufUs = LiGetMicroseconds();
   // qt-Pacer-style predicate: a resync is warranted only if EVERY recent sample shows both a standing
-  // queue (depth >= 2 after popping) and a high latency. Any single good frame resets the window, so
-  // transient jitter bursts are absorbed instead of corrected.
-  if (depth_after_pop >= 2 && latency_ms >= aml_resync_latency_threshold_ms())
+  // queue and a high latency. Any single good frame resets the window, so transient jitter bursts are
+  // absorbed instead of corrected. In frame mode a stuck extra frame completes just after the next
+  // submit, so the FIFO already popped back to depth 1 by then — depth 2 is never observable there.
+  unsigned int backlog_min_depth = amlFrameModeActive ? 1 : 2;
+
+  if (depth_after_pop >= backlog_min_depth && latency_ms >= aml_resync_latency_threshold_ms())
     amlBacklogConsecutiveSamples++;
   else
     amlBacklogConsecutiveSamples = 0;
