@@ -59,6 +59,7 @@
 #define AML_RESYNC_COOLDOWN_US (15ULL * 1000ULL * 1000ULL)
 #define AML_RESYNC_LATENCY_THRESHOLD_FRAMES_X2 7
 #define AML_FRAME_MODE_RESYNC_THRESHOLD_FRAMES_X2 2
+#define AML_MAX_INEFFECTIVE_RESYNCS 2
 #define AML_BACKLOG_WINDOW_MIN_SAMPLES 15
 #define AML_BACKLOG_WINDOW_MAX_SAMPLES 120
 #define AML_PIPELINE_STALL_US (500ULL * 1000ULL)
@@ -112,6 +113,13 @@ static double amlLatestDecodeLatencyMs = 0.0;
 // standing queue with high latency; one window's worth arms the resync backstop, any good frame resets it.
 static unsigned int amlBacklogWindowSamples = 30;
 static unsigned int amlBacklogConsecutiveSamples = 0;
+// Consecutive sustained-backlog resyncs that failed to restore healthy latency (guarded by amlDebugMutex).
+// Some stuck states survive an IDR drain (the pipeline re-parks a frame immediately); once the limit is
+// reached the sustained clause stops firing so the session is not peppered with pointless IDR hiccups.
+// Any healthy sample clears it, giving a future distinct episode a fresh set of attempts.
+static unsigned int amlIneffectiveResyncCount = 0;
+static unsigned int amlHealthyConsecutiveSamples = 0;
+static bool amlResyncGiveUpLogged = false;
 static uint64_t amlLastDqbufUs = 0;
 static int amlConfiguredRateX100 = 0;
 static unsigned int amlConfiguredFrameDurationTicks = 0;
@@ -874,10 +882,26 @@ static void aml_record_pipeline_sample(unsigned int depth_after_pop, double late
   // submit, so the FIFO already popped back to depth 1 by then — depth 2 is never observable there.
   unsigned int backlog_min_depth = amlFrameModeActive ? 1 : 2;
 
-  if (depth_after_pop >= backlog_min_depth && latency_ms >= aml_resync_latency_threshold_ms())
+  double resync_threshold_ms = aml_resync_latency_threshold_ms();
+
+  if (depth_after_pop >= backlog_min_depth && latency_ms >= resync_threshold_ms) {
     amlBacklogConsecutiveSamples++;
-  else
+    amlHealthyConsecutiveSamples = 0;
+  } else {
     amlBacklogConsecutiveSamples = 0;
+    // Clear the give-up latch only after a full window of consecutive healthy samples. The stuck state
+    // averages just above the threshold but individual samples occasionally dip below it, and a resync's
+    // drop window drains the FIFO to depth-0 pops — neither may hand recovery a fresh set of attempts.
+    if (latency_ms < resync_threshold_ms) {
+      amlHealthyConsecutiveSamples++;
+      if (amlHealthyConsecutiveSamples >= amlBacklogWindowSamples) {
+        amlIneffectiveResyncCount = 0;
+        amlResyncGiveUpLogged = false;
+      }
+    } else {
+      amlHealthyConsecutiveSamples = 0;
+    }
+  }
 
   pthread_mutex_unlock(&amlDebugMutex);
 }
@@ -924,6 +948,30 @@ static bool aml_should_request_resync(unsigned int pending_depth) {
                      last_dqbuf_us != 0 && now_us > last_dqbuf_us + AML_PIPELINE_STALL_US;
   if (!sustained_backlog && !pipeline_stalled)
     return false;
+
+  // Give-up latch for the sustained clause only: if repeated resyncs never brought latency back down,
+  // this stuck state does not respond to an IDR drain — keep streaming at the elevated-but-stable
+  // latency instead of hiccuping the session every cooldown period. A real stall stays exempt.
+  if (sustained_backlog && !pipeline_stalled) {
+    bool give_up = false;
+
+    pthread_mutex_lock(&amlDebugMutex);
+    if (amlIneffectiveResyncCount >= AML_MAX_INEFFECTIVE_RESYNCS) {
+      give_up = true;
+    } else {
+      amlIneffectiveResyncCount++;
+    }
+    pthread_mutex_unlock(&amlDebugMutex);
+
+    if (give_up) {
+      if (!amlResyncGiveUpLogged) {
+        amlResyncGiveUpLogged = true;
+        printf("AML: sustained backlog persists after %u resyncs; accepting ~1 frame of standing latency\n",
+            AML_MAX_INEFFECTIVE_RESYNCS);
+      }
+      return false;
+    }
+  }
 
   // Throttle reset/IDR requests so a single burst of late frames cannot trap the session in a reset loop.
   amlLastResyncRequestUs = now_us;
@@ -1228,6 +1276,9 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlAwaitingIdrSinceUs = 0;
   amlLatestDecodeLatencyMs = 0.0;
   amlBacklogConsecutiveSamples = 0;
+  amlIneffectiveResyncCount = 0;
+  amlHealthyConsecutiveSamples = 0;
+  amlResyncGiveUpLogged = false;
   amlLastDqbufUs = 0;
   // One second's worth of DQBUF samples must all look bad before the backstop may fire.
   amlBacklogWindowSamples = redrawRate < AML_BACKLOG_WINDOW_MIN_SAMPLES ? AML_BACKLOG_WINDOW_MIN_SAMPLES :
