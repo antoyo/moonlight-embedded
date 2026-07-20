@@ -117,6 +117,7 @@ static unsigned int amlConfiguredFrameDurationTicks = 0;
 static uint64_t amlConfiguredFrameDurationUs = AML_DEFAULT_FRAME_DURATION_US;
 static int amlFracRatePolicy = -1;
 static bool amlDisplayTrackingEnabled = false;
+static bool amlFrameModeActive = false;
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 
@@ -1226,6 +1227,7 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   amlConfiguredFrameDurationUs = redrawRate > 0 ? (1000000ULL / (uint64_t) redrawRate) : AML_DEFAULT_FRAME_DURATION_US;
   amlFracRatePolicy = -1;
   amlDisplayTrackingEnabled = false;
+  amlFrameModeActive = false;
   amlTargetDelayMs = aml_target_delay_ms(redrawRate);
   amlInduceStallMs = 0;
   amlInduceStallDone = false;
@@ -1241,13 +1243,22 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
   overlayEnabled = stats_pref != NULL && stats_pref->enabled;
   overlayReady = false;
 
-#ifdef STREAM_TYPE_FRAME
-  codecParam.dec_mode           = STREAM_TYPE_FRAME;
-#endif
-
-#ifdef FRAME_BASE_PATH_AMLVIDEO_AMVIDEO
-  codecParam.video_path         = FRAME_BASE_PATH_AMLVIDEO_AMVIDEO;
-#endif
+  // Frame-based decode: OSMC's libamcodec opens /dev/amstream_hevc_frame when decoder_type is
+  // DECODER_TYPE_FRAME_MODE. Each codec_write() then carries exactly one access unit, which
+  // becomes one decoder input chunk that is scheduled immediately. The legacy stream-parser
+  // path instead delimits access units by scanning for the next frame's start code, which
+  // holds every frame back by two input frame-periods (~33 ms at 60 fps) before decode.
+  // FRAME_BASE_PATH_AMVIDEO selects the same per-instance VFM chain Kodi uses on the Vero;
+  // it keeps amlvideo in the chain so the /dev/video10 display thread keeps tracking frames.
+  // (FRAME_BASE_PATH_AMLVIDEO_AMVIDEO, with amlvideo directly behind the decoder, stalls after
+  // a couple of frames on this kernel — amlvideo does not forward to a downstream ppmgr.)
+  // Frame mode is set per codec below: HEVC (and AV1, which has no start codes) use it; H264
+  // stays on the single-instance stream path, mirroring Kodi's per-codec choices on the Vero.
+  codecParam.decoder_type       = DECODER_TYPE_SINGLE_MODE;
+  codecParam.video_path         = FRAME_BASE_PATH_AMVIDEO;
+  codecParam.display_mode       = DISPLAY_MODE_AMVIDEO;
+  codecParam.config             = NULL;
+  codecParam.config_len         = 0;
 
   if (videoFormat & VIDEO_FORMAT_MASK_H264) {
     if (width > 1920 || height > 1080) {
@@ -1266,14 +1277,25 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
           codecParam.am_sysinfo.param = (void*) UCODE_IP_ONLY_PARAM;
     }
   } else if (videoFormat & VIDEO_FORMAT_MASK_H265) {
+    // vh265 keeps its instance-level ip_mode (output each frame at its own decode-done IRQ instead
+    // of during the NEXT frame's slice processing) across pic-list re-inits only when the client
+    // sets low_latency_flag; without it a mid-stream re-init permanently costs one frame-period.
+    // The flag is only reachable through the per-instance decoder config string.
+    static char hevc_low_latency_config[] = "parm_v4l_low_latency_mode:1";
+
     codec = "HEVC";
     codecParam.video_type = VFORMAT_HEVC;
     codecParam.am_sysinfo.format = VIDEO_DEC_FORMAT_HEVC;
+    codecParam.decoder_type = DECODER_TYPE_FRAME_MODE;
+    codecParam.config = hevc_low_latency_config;
+    codecParam.config_len = sizeof(hevc_low_latency_config) - 1;
 #ifdef CODEC_TAG_AV1
   } else if (videoFormat & VIDEO_FORMAT_MASK_AV1) {
     codec = "AV1";
     codecParam.video_type = VFORMAT_AV1;
     codecParam.am_sysinfo.format = VIDEO_DEC_FORMAT_AV1;
+    // AV1 has no start codes for a stream parser to delimit; frame-based submission is required.
+    codecParam.decoder_type = DECODER_TYPE_FRAME_MODE;
 #endif
   } else {
     printf("Video format not supported\n");
@@ -1303,9 +1325,17 @@ int aml_setup(int videoFormat, int width, int height, int redrawRate, void* cont
 
   int ret;
   if ((ret = codec_init(&codecParam)) != 0) {
-    fprintf(stderr, "codec_init error: %x\n", ret);
-    return -2;
+    // The frame port may be unavailable (older kernel/libamcodec); the legacy single-instance
+    // stream-parser mode still works, just with ~2 frame-periods more decode latency.
+    fprintf(stderr, "codec_init failed in frame mode: %x, retrying in single mode\n", ret);
+    codecParam.decoder_type = DECODER_TYPE_SINGLE_MODE;
+    if ((ret = codec_init(&codecParam)) != 0) {
+      fprintf(stderr, "codec_init error: %x\n", ret);
+      return -2;
+    }
   }
+  amlFrameModeActive = codecParam.decoder_type == DECODER_TYPE_FRAME_MODE;
+  printf("AML decode mode: %s\n", amlFrameModeActive ? "frame" : "single (stream parser)");
 
   if ((ret = codec_set_freerun_mode(&codecParam, 1)) != 0) {
     fprintf(stderr, "Can't set Freerun mode: %x\n", ret);
