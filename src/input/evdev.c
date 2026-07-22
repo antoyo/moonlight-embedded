@@ -38,6 +38,8 @@
 #include <limits.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
+#include <stdint.h>
 #ifdef __linux__
 #include <endian.h>
 #else
@@ -87,6 +89,7 @@ struct input_device {
   short rightStickX, rightStickY;
   bool gamepadModified;
   bool mouseEmulation;
+  uint64_t lastGamepadSynUs;
   pthread_t meThread;
   struct input_abs_parms xParms, yParms, rxParms, ryParms, zParms, rzParms;
   struct input_abs_parms leftParms, rightParms, upParms, downParms;
@@ -140,6 +143,155 @@ int evdev_gamepads = 0;
 
 static bool (*handler) (struct input_event*, struct input_device*);
 
+// ---------------------------------------------------------------------------
+// Gamepad input-latency instrumentation (enabled with -verbose).
+// All of it runs on the main input loop thread, so no locking is needed.
+// ---------------------------------------------------------------------------
+
+static bool evdevDebugEnabled = false;
+
+// How often the summary line is emitted.
+#define EVDEV_DEBUG_WINDOW_US 1000000ULL
+// Samples above this are attributed to clock skew (EVIOCSCLOCKID not in effect,
+// i.e. event timestamps are not CLOCK_MONOTONIC) and excluded from the histogram.
+#define EVDEV_DEBUG_SKEW_LIMIT_US 10000000ULL
+
+// Kernel-event-to-send latency buckets: <0.25 <0.5 <1 <2 <5 <10 >=10 ms.
+#define EVDEV_DEBUG_LAT_BUCKETS 7
+static const uint64_t evdevDebugLatBoundsUs[EVDEV_DEBUG_LAT_BUCKETS - 1] =
+    {250, 500, 1000, 2000, 5000, 10000};
+static const char* const evdevDebugLatLabels[EVDEV_DEBUG_LAT_BUCKETS] =
+    {"<0.25", "<0.5", "<1", "<2", "<5", "<10", ">=10"};
+
+// Inter-SYN interval buckets tuned to discriminate USB poll cadences (~2/~4/~8/~10 ms).
+#define EVDEV_DEBUG_INT_BUCKETS 9
+static const uint64_t evdevDebugIntBoundsUs[EVDEV_DEBUG_INT_BUCKETS - 1] =
+    {1500, 2500, 3500, 4500, 6000, 9000, 11000, 20000};
+static const char* const evdevDebugIntLabels[EVDEV_DEBUG_INT_BUCKETS] =
+    {"<1.5", "~2", "~3", "~4", "~5", "~8", "~10", "<20", ">=20"};
+
+// One accumulation window of gamepad send metrics.
+struct evdev_debug_metrics {
+  uint64_t windowStartUs;
+  unsigned int sendCount;
+  unsigned int latCount;
+  uint64_t latSumUs, latMaxUs;
+  unsigned int latHist[EVDEV_DEBUG_LAT_BUCKETS];
+  unsigned int intervalCount;
+  uint64_t intervalSumUs, intervalMaxUs;
+  unsigned int intervalHist[EVDEV_DEBUG_INT_BUCKETS];
+  uint64_t sendCallSumUs, sendCallMaxUs;
+  unsigned int clockSkewCount;
+};
+
+static struct evdev_debug_metrics evdevDebugMetrics;
+
+/** Returns the current CLOCK_MONOTONIC time in microseconds (the clock evdev devices are switched to). */
+static uint64_t evdev_debug_now_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) (ts.tv_nsec / 1000);
+}
+
+/** Increments the histogram bucket value_us falls into, given ascending upper bounds (last bucket is open-ended). */
+static void evdev_debug_bucket(unsigned int* hist, const uint64_t* bounds, int buckets, uint64_t value_us) {
+  int i;
+  for (i = 0; i < buckets - 1; i++) {
+    if (value_us < bounds[i])
+      break;
+  }
+  hist[i]++;
+}
+
+/** Formats a histogram as space-separated "label:count" pairs into buf. */
+static void evdev_debug_format_hist(char* buf, size_t size, const char* const* labels, const unsigned int* hist, int buckets) {
+  size_t off = 0;
+  for (int i = 0; i < buckets && off < size; i++)
+    off += snprintf(buf + off, size - off, "%s%s:%u", i > 0 ? " " : "", labels[i], hist[i]);
+}
+
+/** Prints the once-per-second gamepad latency summary line and resets the accumulation window. */
+static void evdev_debug_report(uint64_t now_us) {
+  struct evdev_debug_metrics* m = &evdevDebugMetrics;
+  char lat_hist[160];
+  char int_hist[192];
+  uint32_t rtt_ms = 0, rtt_var_ms = 0;
+  char rtt_str[48];
+
+  evdev_debug_format_hist(lat_hist, sizeof(lat_hist), evdevDebugLatLabels, m->latHist, EVDEV_DEBUG_LAT_BUCKETS);
+  evdev_debug_format_hist(int_hist, sizeof(int_hist), evdevDebugIntLabels, m->intervalHist, EVDEV_DEBUG_INT_BUCKETS);
+
+  // One-way network share for the same window, from common-c's RTT estimate.
+  if (LiGetEstimatedRttInfo(&rtt_ms, &rtt_var_ms))
+    snprintf(rtt_str, sizeof(rtt_str), "rtt %u ms (var %u)", rtt_ms, rtt_var_ms);
+  else
+    snprintf(rtt_str, sizeof(rtt_str), "rtt n/a");
+
+  printf("EVDEV debug: gamepad ev->send avg %.2f ms max %.2f ms [%s], SYN interval avg %.2f ms max %.2f ms [%s], LiSend avg %.3f ms max %.3f ms, sends %u, clock_skew %u, %s\n",
+         m->latCount > 0 ? (double) m->latSumUs / m->latCount / 1000.0 : 0.0,
+         (double) m->latMaxUs / 1000.0,
+         lat_hist,
+         m->intervalCount > 0 ? (double) m->intervalSumUs / m->intervalCount / 1000.0 : 0.0,
+         (double) m->intervalMaxUs / 1000.0,
+         int_hist,
+         m->sendCount > 0 ? (double) m->sendCallSumUs / m->sendCount / 1000.0 : 0.0,
+         (double) m->sendCallMaxUs / 1000.0,
+         m->sendCount,
+         m->clockSkewCount,
+         rtt_str);
+
+  memset(m, 0, sizeof(*m));
+  m->windowStartUs = now_us;
+}
+
+/** Records one gamepad send: kernel-to-send latency, SYN cadence and LiSend call cost; emits the 1s summary when due. */
+static void evdev_debug_note_gamepad_send(uint64_t event_us, uint64_t before_us, uint64_t after_us, uint64_t prev_syn_us) {
+  struct evdev_debug_metrics* m = &evdevDebugMetrics;
+
+  if (m->windowStartUs == 0)
+    m->windowStartUs = after_us;
+
+  m->sendCount++;
+
+  // Kernel event timestamp -> send-call latency. Oversized or negative deltas mean the
+  // device clock is not CLOCK_MONOTONIC; count them separately instead of poisoning the stats.
+  if (before_us >= event_us && before_us - event_us < EVDEV_DEBUG_SKEW_LIMIT_US) {
+    uint64_t lat_us = before_us - event_us;
+
+    m->latCount++;
+    m->latSumUs += lat_us;
+    if (lat_us > m->latMaxUs)
+      m->latMaxUs = lat_us;
+    evdev_debug_bucket(m->latHist, evdevDebugLatBoundsUs, EVDEV_DEBUG_LAT_BUCKETS, lat_us);
+  } else {
+    m->clockSkewCount++;
+  }
+
+  // Inter-SYN cadence from event timestamps: reflects the device/USB report rate, not our scheduling.
+  if (prev_syn_us != 0 && event_us > prev_syn_us && event_us - prev_syn_us < EVDEV_DEBUG_SKEW_LIMIT_US) {
+    uint64_t interval_us = event_us - prev_syn_us;
+
+    m->intervalCount++;
+    m->intervalSumUs += interval_us;
+    if (interval_us > m->intervalMaxUs)
+      m->intervalMaxUs = interval_us;
+    evdev_debug_bucket(m->intervalHist, evdevDebugIntBoundsUs, EVDEV_DEBUG_INT_BUCKETS, interval_us);
+  }
+
+  // LiSendMultiControllerEvent call duration (queue handoff cost, exposes contention).
+  if (after_us >= before_us) {
+    uint64_t call_us = after_us - before_us;
+
+    m->sendCallSumUs += call_us;
+    if (call_us > m->sendCallMaxUs)
+      m->sendCallMaxUs = call_us;
+  }
+
+  if (after_us - m->windowStartUs >= EVDEV_DEBUG_WINDOW_US)
+    evdev_debug_report(after_us);
+}
+
+/** Finds the index in an evdev code map, or -1 when the code is unmapped. */
 static int evdev_get_map(int* map, int length, int value) {
   for (int i = 0; i < length; i++) {
     if (value == map[i])
@@ -371,8 +523,19 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
         send_controller_arrival(dev);
       }
       // Send event only if mouse emulation is disabled.
-      if (dev->mouseEmulation == false)
-        LiSendMultiControllerEvent(dev->controllerId, assignedControllerIds, dev->buttonFlags, dev->leftTrigger, dev->rightTrigger, dev->leftStickX, dev->leftStickY, dev->rightStickX, dev->rightStickY);
+      if (dev->mouseEmulation == false) {
+        if (evdevDebugEnabled) {
+          // Timestamps around the send measure kernel->userspace wakeup latency and the LiSend call cost.
+          uint64_t event_us = (uint64_t) ev->input_event_sec * 1000000ULL + (uint64_t) ev->input_event_usec;
+          uint64_t before_us = evdev_debug_now_us();
+
+          LiSendMultiControllerEvent(dev->controllerId, assignedControllerIds, dev->buttonFlags, dev->leftTrigger, dev->rightTrigger, dev->leftStickX, dev->leftStickY, dev->rightStickX, dev->rightStickY);
+          evdev_debug_note_gamepad_send(event_us, before_us, evdev_debug_now_us(), dev->lastGamepadSynUs);
+          dev->lastGamepadSynUs = event_us;
+        } else {
+          LiSendMultiControllerEvent(dev->controllerId, assignedControllerIds, dev->buttonFlags, dev->leftTrigger, dev->rightTrigger, dev->leftStickX, dev->leftStickY, dev->rightStickX, dev->rightStickY);
+        }
+      }
       dev->gamepadModified = false;
     }
     break;
@@ -793,6 +956,11 @@ void evdev_create(const char* device, struct mapping* mappings, bool verbose, in
 
   struct libevdev *evdev = libevdev_new();
   libevdev_set_fd(evdev, fd);
+  // Switch event timestamps to CLOCK_MONOTONIC so the latency instrumentation can
+  // compare them against clock_gettime(CLOCK_MONOTONIC). Behavior-neutral otherwise:
+  // all other timestamp consumers only use differences between event timestamps.
+  if (libevdev_set_clock_id(evdev, CLOCK_MONOTONIC) < 0 && verbose)
+    fprintf(stderr, "Could not enable monotonic timestamps for %s\n", device);
   const char* name = libevdev_get_name(evdev);
 
   int16_t guid[8] = {0};
@@ -1089,9 +1257,11 @@ void evdev_stop() {
   evdev_drain();
 }
 
-void evdev_init(bool mouse_emulation_enabled) {
+/** Configures evdev input handling; debug_enabled turns on the -verbose gamepad latency instrumentation. */
+void evdev_init(bool mouse_emulation_enabled, bool debug_enabled) {
   handler = evdev_handle_event;
   mouseEmulationEnabled = mouse_emulation_enabled;
+  evdevDebugEnabled = debug_enabled;
 }
 
 static struct input_device* evdev_get_input_device(unsigned short controller_id) {

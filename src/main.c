@@ -420,7 +420,7 @@ int main(int argc, char* argv[]) {
         }
 
         udev_init(!inputAdded, mappings, config.debug_level > 0, config.rotate);
-        evdev_init(config.mouse_emulation);
+        evdev_init(config.mouse_emulation, config.debug_level > 0);
         rumble_handler = evdev_rumble;
         #ifdef HAVE_LIBCEC
         cec_init();
